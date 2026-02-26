@@ -86,7 +86,9 @@ impl KrakenSpotExecutionClient {
 
         let cancellation_token = CancellationToken::new();
 
-        let http = KrakenSpotHttpClient::new(
+        let http = KrakenSpotHttpClient::with_credentials(
+            config.api_key.clone(),
+            config.api_secret.clone(),
             config.environment,
             config.base_url.clone(),
             config.timeout_secs,
