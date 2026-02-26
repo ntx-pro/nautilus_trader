@@ -15,7 +15,7 @@
 
 //! Kraken Spot execution client implementation.
 
-use std::{future::Future, sync::Mutex};
+use std::{future::Future, sync::Mutex, time::{Duration, Instant}};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -138,6 +138,39 @@ impl KrakenSpotExecutionClient {
     #[must_use]
     pub fn emitter(&self) -> &ExecutionEventEmitter {
         &self.emitter
+    }
+
+    /// Waits until the account is registered in the NT cache by the portfolio manager.
+    ///
+    /// The account is registered asynchronously after `send_account_state()` emits
+    /// the initial account state. This poll loop ensures `connect()` doesn't return
+    /// until the portfolio is ready, preventing "no account registered" errors.
+    async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
+        let account_id = self.core.account_id;
+
+        if self.core.cache().account(&account_id).is_some() {
+            log::info!("Account {account_id} registered");
+            return Ok(());
+        }
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        let interval = Duration::from_millis(10);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            if self.core.cache().account(&account_id).is_some() {
+                log::info!("Account {account_id} registered");
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                anyhow::bail!(
+                    "Timeout waiting for account {account_id} to be registered after {timeout_secs}s"
+                );
+            }
+        }
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -497,6 +530,26 @@ impl ExecutionClient for KrakenSpotExecutionClient {
             .context("Failed to subscribe to executions")?;
 
         log::info!("Spot WebSocket authenticated and subscribed to executions");
+
+        // Request initial account state and register with portfolio.
+        // Without this, the portfolio manager doesn't know about the account
+        // and emits "Cannot update order: no account registered" warnings.
+        let account_state = self
+            .http
+            .request_account_state(self.core.account_id)
+            .await
+            .context("Failed to request Kraken account state")?;
+
+        if !account_state.balances.is_empty() {
+            log::info!(
+                "Received account state with {} balance(s)",
+                account_state.balances.len()
+            );
+        }
+        self.emitter.send_account_state(account_state);
+
+        // Wait for account to be registered in cache before completing connect
+        self.await_account_registered(30.0).await?;
 
         self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
