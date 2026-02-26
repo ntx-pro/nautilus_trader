@@ -1142,6 +1142,26 @@ impl KrakenSpotHttpClient {
         self.inner.cancellation_token()
     }
 
+    /// Kraken REST API v2 limits `cl_ord_id` to 18 characters.
+    /// NT generates longer IDs (e.g., `O202602261829430030011` = 22 chars).
+    ///
+    /// Strategy: keep the `O` prefix and the rightmost 17 characters which
+    /// contain the most-unique parts (time seconds, strategy tag, counter).
+    /// This avoids collisions between rapid orders that share a timestamp prefix.
+    ///
+    /// Example: `O202602261829430030011` → `O02261829430030011` (18 chars)
+    fn fit_cl_ord_id(id: &str) -> String {
+        const MAX_LEN: usize = 18;
+        if id.len() <= MAX_LEN {
+            return id.to_string();
+        }
+        // Keep first char (O) + last 17 chars (most-unique: MMDD+HHMMSS+tags+counter)
+        let mut result = String::with_capacity(MAX_LEN);
+        result.push_str(&id[..1]);
+        result.push_str(&id[id.len() - (MAX_LEN - 1)..]);
+        result
+    }
+
     /// Caches an instrument for symbol lookup.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
         self.instruments_cache
@@ -1749,7 +1769,7 @@ impl KrakenSpotHttpClient {
 
         let mut builder = KrakenSpotAddOrderParamsBuilder::default();
         builder
-            .cl_ord_id(client_order_id.to_string())
+            .cl_ord_id(Self::fit_cl_ord_id(&client_order_id.to_string()))
             .broker(NAUTILUS_KRAKEN_BROKER_ID)
             .pair(raw_symbol)
             .side(kraken_side)
@@ -1832,7 +1852,7 @@ impl KrakenSpotHttpClient {
             .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
 
         let txid = venue_order_id.as_ref().map(|id| id.to_string());
-        let cl_ord_id = client_order_id.as_ref().map(|id| id.to_string());
+        let cl_ord_id = client_order_id.as_ref().map(|id| Self::fit_cl_ord_id(&id.to_string()));
 
         if txid.is_none() && cl_ord_id.is_none() {
             anyhow::bail!("Either client_order_id or venue_order_id must be provided");
@@ -1893,7 +1913,7 @@ impl KrakenSpotHttpClient {
             .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
 
         let txid = venue_order_id.as_ref().map(|id| id.to_string());
-        let cl_ord_id = client_order_id.as_ref().map(|id| id.to_string());
+        let cl_ord_id = client_order_id.as_ref().map(|id| Self::fit_cl_ord_id(&id.to_string()));
 
         if txid.is_none() && cl_ord_id.is_none() {
             anyhow::bail!("Either client_order_id or venue_order_id must be provided");

@@ -99,6 +99,9 @@ pub(super) struct SpotFeedHandler {
     subscriptions: SubscriptionState,
     instruments_cache: AHashMap<Ustr, InstrumentAny>,
     client_order_cache: AHashMap<ClientOrderId, CachedOrderInfo>,
+    /// Maps truncated cl_ord_id (max 18 chars for Kraken) → full ClientOrderId.
+    /// Needed because NT generates IDs longer than Kraken's 18-char limit.
+    cl_ord_id_map: AHashMap<String, ClientOrderId>,
     order_qty_cache: AHashMap<VenueOrderId, f64>,
     book_sequence: u64,
     pending_messages: VecDeque<NautilusWsMessage>,
@@ -123,6 +126,7 @@ impl SpotFeedHandler {
             subscriptions,
             instruments_cache: AHashMap::new(),
             client_order_cache: AHashMap::new(),
+            cl_ord_id_map: AHashMap::new(),
             order_qty_cache: AHashMap::new(),
             book_sequence: 0,
             pending_messages: VecDeque::new(),
@@ -219,6 +223,16 @@ impl SpotFeedHandler {
                                 "Cached client order info: \
                                 client_order_id={client_order_id}, instrument_id={instrument_id}"
                             );
+                            // Kraken cl_ord_id max 18 chars. Store mapping from the
+                            // shortened ID (O + last 17 chars) → full ClientOrderId
+                            // so we can resolve the full NT ID from Kraken events.
+                            let id_str = client_order_id.to_string();
+                            if id_str.len() > 18 {
+                                let mut short = String::with_capacity(18);
+                                short.push_str(&id_str[..1]);
+                                short.push_str(&id_str[id_str.len() - 17..]);
+                                self.cl_ord_id_map.insert(short, client_order_id);
+                            }
                             self.client_order_cache.insert(
                                 client_order_id,
                                 CachedOrderInfo {
@@ -622,18 +636,32 @@ impl SpotFeedHandler {
                             .as_ref()
                             .filter(|id| !id.is_empty())
                             .and_then(|id| {
+                                // Try exact match first, then resolve truncated ID
+                                let key = ClientOrderId::new(id);
                                 self.client_order_cache
-                                    .get(&ClientOrderId::new(id))
+                                    .get(&key)
                                     .cloned()
+                                    .or_else(|| {
+                                        self.cl_ord_id_map
+                                            .get(id)
+                                            .and_then(|full_id| self.client_order_cache.get(full_id).cloned())
+                                    })
                             });
                         (inst, cached)
                     } else if let Some(ref cl_ord_id) =
                         exec_data.cl_ord_id.as_ref().filter(|id| !id.is_empty())
                     {
+                        // Try exact match first, then resolve truncated ID
+                        let key = ClientOrderId::new(cl_ord_id);
                         let cached = self
                             .client_order_cache
-                            .get(&ClientOrderId::new(cl_ord_id))
-                            .cloned();
+                            .get(&key)
+                            .cloned()
+                            .or_else(|| {
+                                self.cl_ord_id_map
+                                    .get(cl_ord_id.as_str())
+                                    .and_then(|full_id| self.client_order_cache.get(full_id).cloned())
+                            });
                         let inst = cached.as_ref().and_then(|info| {
                             self.instruments_cache
                                 .iter()
@@ -668,10 +696,18 @@ impl SpotFeedHandler {
                     // Emit proper order events when we have cached info, otherwise fall back
                     // to OrderStatusReport for external orders or reconciliation
                     if let Some(ref info) = cached_info {
+                        // Resolve full ClientOrderId: Kraken may return a truncated
+                        // cl_ord_id (max 18 chars). Use the mapping to recover the
+                        // full NT ClientOrderId for correct event correlation.
                         let client_order_id = exec_data
                             .cl_ord_id
                             .as_ref()
-                            .map(ClientOrderId::new)
+                            .and_then(|id| {
+                                self.cl_ord_id_map
+                                    .get(id.as_str())
+                                    .cloned()
+                                    .or_else(|| Some(ClientOrderId::new(id)))
+                            })
                             .expect("cl_ord_id should exist if cached");
                         let venue_order_id = VenueOrderId::new(&exec_data.order_id);
 
