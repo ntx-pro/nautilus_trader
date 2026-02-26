@@ -342,9 +342,22 @@ impl WebSocketClientInner {
 
         // Wrap stream appropriately based on scheme
         let maybe_tls_stream = if scheme == "wss" {
-            // Build TLS config with webpki roots
+            // Build TLS config: prefer native OS certs, fallback to bundled webpki roots
             let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            match rustls_native_certs::load_native_certs() {
+                Ok(certs) => {
+                    for cert in certs {
+                        if let Err(e) = root_store.add(cert) {
+                            log::debug!("Failed to add native cert: {e}");
+                        }
+                    }
+                    log::debug!("Loaded {} native root certificates", root_store.len());
+                }
+                Err(e) => {
+                    log::warn!("Failed to load native certs ({e}), using bundled webpki roots");
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                }
+            }
 
             let config = ClientConfig::builder()
                 .with_root_certificates(root_store)
