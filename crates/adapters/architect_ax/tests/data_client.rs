@@ -206,10 +206,11 @@ async fn test_handler_parses_candle_to_bar() {
     tokio::pin!(stream);
 
     // Handler only emits bar when candle closes (timestamp changes)
-    // Mock server sends two candles, so we should receive one bar
+    // Mock server sends two candles, so we should receive one bar.
+    // Use longer timeout and more iterations for slow CI (e.g. macOS).
     let mut found_bar = false;
-    for _ in 0..5 {
-        let result = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+    for _ in 0..15 {
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
         match result {
             Ok(Some(NautilusDataWsMessage::Bar(bar))) => {
                 assert_eq!(bar.bar_type.instrument_id().symbol.as_str(), "EURUSD-PERP");
