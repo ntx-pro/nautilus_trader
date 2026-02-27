@@ -28,7 +28,11 @@ use nautilus_common::{
     component::Component,
     enums::{Environment, LogColor},
     log_info,
-    messages::{DataEvent, ExecutionEvent, data::DataCommand, execution::TradingCommand},
+    messages::{
+        DataEvent, ExecutionEvent,
+        data::DataCommand,
+        execution::{ExecutionReport, TradingCommand},
+    },
     timer::TimeEventHandler,
 };
 use nautilus_core::UUID4;
@@ -606,10 +610,15 @@ impl LiveNode {
                         pending.data_cmds.push(cmd);
                     }
                     Some(evt) = exec_evt_rx.recv() => {
-                        // Account and Report events are safe, order events conflict
                         match evt {
-                            ExecutionEvent::Account(_) | ExecutionEvent::Report(_) => {
+                            ExecutionEvent::Account(_) => {
+                                // Account events borrow cache + portfolio, NOT exec_engine — safe
                                 AsyncRunner::handle_exec_event(evt);
+                            }
+                            ExecutionEvent::Report(report) => {
+                                // Report events trigger exec_engine.borrow_mut() via msgbus handler
+                                // — conflicts with exec_engine borrow held by connect_clients()
+                                pending.report_evts.push(report);
                             }
                             ExecutionEvent::Order(order_evt) => {
                                 pending.order_evts.push(order_evt);
@@ -974,6 +983,7 @@ struct PendingEvents {
     data_cmds: Vec<DataCommand>,
     data_evts: Vec<DataEvent>,
     exec_cmds: Vec<TradingCommand>,
+    report_evts: Vec<ExecutionReport>,
     order_evts: Vec<OrderEventAny>,
 }
 
@@ -982,15 +992,17 @@ impl PendingEvents {
         let total = self.data_evts.len()
             + self.data_cmds.len()
             + self.exec_cmds.len()
+            + self.report_evts.len()
             + self.order_evts.len();
 
         if total > 0 {
             log::debug!(
                 "Processing {total} events/commands queued during startup \
-                 (data_evts={}, data_cmds={}, exec_cmds={}, order_evts={})",
+                 (data_evts={}, data_cmds={}, exec_cmds={}, report_evts={}, order_evts={})",
                 self.data_evts.len(),
                 self.data_cmds.len(),
                 self.exec_cmds.len(),
+                self.report_evts.len(),
                 self.order_evts.len()
             );
         }
@@ -1003,6 +1015,9 @@ impl PendingEvents {
         }
         for cmd in self.exec_cmds.drain(..) {
             AsyncRunner::handle_exec_command(cmd);
+        }
+        for report in self.report_evts.drain(..) {
+            AsyncRunner::handle_exec_report(report);
         }
         for evt in self.order_evts.drain(..) {
             AsyncRunner::handle_exec_event(ExecutionEvent::Order(evt));
