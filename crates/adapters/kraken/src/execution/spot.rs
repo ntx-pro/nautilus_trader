@@ -513,6 +513,27 @@ impl ExecutionClient for KrakenSpotExecutionClient {
 
         self.ws.set_account_id(self.core.account_id);
 
+        // Request initial account state and register with portfolio BEFORE
+        // spawning the message handler. The handler + subscribe_executions
+        // generate Report events that trigger ExecEngine processing, which
+        // requires the account to already be registered. Doing account
+        // registration after spawn causes a RefCell double borrow panic
+        // on the single-threaded event loop.
+        let account_state = self
+            .http
+            .request_account_state(self.core.account_id)
+            .await
+            .context("Failed to request Kraken account state")?;
+
+        if !account_state.balances.is_empty() {
+            log::info!(
+                "Received account state with {} balance(s)",
+                account_state.balances.len()
+            );
+        }
+        self.emitter.send_account_state(account_state);
+        self.await_account_registered(30.0).await?;
+
         self.spawn_message_handler()?;
 
         // Always cache to WS handler (reconnect spawns a fresh handler)
@@ -530,26 +551,6 @@ impl ExecutionClient for KrakenSpotExecutionClient {
             .context("Failed to subscribe to executions")?;
 
         log::info!("Spot WebSocket authenticated and subscribed to executions");
-
-        // Request initial account state and register with portfolio.
-        // Without this, the portfolio manager doesn't know about the account
-        // and emits "Cannot update order: no account registered" warnings.
-        let account_state = self
-            .http
-            .request_account_state(self.core.account_id)
-            .await
-            .context("Failed to request Kraken account state")?;
-
-        if !account_state.balances.is_empty() {
-            log::info!(
-                "Received account state with {} balance(s)",
-                account_state.balances.len()
-            );
-        }
-        self.emitter.send_account_state(account_state);
-
-        // Wait for account to be registered in cache before completing connect
-        self.await_account_registered(30.0).await?;
 
         self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
