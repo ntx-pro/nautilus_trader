@@ -705,7 +705,7 @@ impl SpotFeedHandler {
                             .and_then(|id| {
                                 self.cl_ord_id_map
                                     .get(id.as_str())
-                                    .cloned()
+                                    .copied()
                                     .or_else(|| Some(ClientOrderId::new(id)))
                             })
                             .expect("cl_ord_id should exist if cached");
