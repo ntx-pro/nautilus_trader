@@ -1026,10 +1026,44 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         })
     }
 
-    /// Loads all general key-value state from Redis. Currently returns empty map (TODO).
+    /// Loads all general key-value state from Redis.
+    ///
+    /// Scans all keys matching `general:*`, reads values via MGET,
+    /// and returns a map with original keys (trader_key prefix stripped).
+    /// Called during startup by `Cache::cache_general()` to restore
+    /// actor/strategy custom state persisted via `add(key, value)`.
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
-        // self.database.load()
-        Ok(AHashMap::new()) // TODO
+        let trader_key = self.database.trader_key.clone();
+        let pattern = format!("{trader_key}{REDIS_DELIMITER}{GENERAL}{REDIS_DELIMITER}*");
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{GENERAL}{REDIS_DELIMITER}");
+        let mut con = self.database.con.clone();
+
+        let (tx, rx) = mpsc::sync_channel(1);
+
+        get_runtime().spawn(async move {
+            let result: anyhow::Result<AHashMap<String, Bytes>> = async {
+                let keys = DatabaseQueries::scan_keys(&mut con, pattern).await?;
+                if keys.is_empty() {
+                    return Ok(AHashMap::new());
+                }
+
+                let values = DatabaseQueries::read_bulk(&con, &keys).await?;
+
+                let mut map = AHashMap::with_capacity(keys.len());
+                for (key, value_opt) in keys.iter().zip(values.into_iter()) {
+                    if let Some(value) = value_opt {
+                        let clean_key = key.strip_prefix(&prefix).unwrap_or(key);
+                        map.insert(clean_key.to_string(), value);
+                    }
+                }
+                Ok(map)
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+
+        blocking_recv(&rx)
+            .map_err(|e| anyhow::anyhow!("Failed to receive load() result: {e}"))?
     }
 
     /// Delegates to [`DatabaseQueries::load_currencies`] to scan and deserialize all persisted currencies.
