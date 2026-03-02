@@ -37,8 +37,11 @@ use nautilus_model::{
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
     },
     events::{
-        AccountState, OrderAccepted, OrderCanceled, OrderFilled, OrderRejected, PositionChanged,
-        PositionClosed, PositionOpened,
+        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
+        OrderEmulated, OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected,
+        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
+        OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged, PositionClosed,
+        PositionOpened,
     },
     instruments::InstrumentAny,
 };
@@ -718,6 +721,73 @@ impl FeatherWriter {
                 let mut writer = writer.borrow_mut();
                 if let Err(e) = runtime.block_on(writer.write(*event)) {
                     log::warn!("Failed to write FundingRateUpdate: {e}");
+                }
+            // Order lifecycle events
+            } else if let Some(event) = message.downcast_ref::<OrderInitialized>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(event.clone())) {
+                    log::warn!("Failed to write OrderInitialized: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderSubmitted>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderSubmitted: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderDenied>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderDenied: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderExpired>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderExpired: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderTriggered>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderTriggered: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderUpdated>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderUpdated: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderPendingCancel>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderPendingCancel: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderPendingUpdate>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderPendingUpdate: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderCancelRejected>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderCancelRejected: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderModifyRejected>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderModifyRejected: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderEmulated>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderEmulated: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderReleased>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderReleased: {e}");
+                }
+            // Position adjustment events
+            } else if let Some(event) = message.downcast_ref::<PositionAdjusted>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write PositionAdjusted: {e}");
                 }
             }
             // Silently ignore other message types (commands, signals, etc.)
