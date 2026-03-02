@@ -65,7 +65,7 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
         TraderId, VenueOrderId,
     },
-    instruments::{InstrumentAny, SyntheticInstrument},
+    instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
     orders::OrderAny,
     position::Position,
@@ -1228,16 +1228,61 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         todo!()
     }
 
+    /// Persists a currency definition to Redis.
+    ///
+    /// Stores as a STRING value under key `currencies:{code}`.
+    /// Serialized using the configured encoding (MsgPack or JSON).
     fn add_currency(&self, currency: &Currency) -> anyhow::Result<()> {
-        todo!()
+        let key = format!("{CURRENCIES}{REDIS_DELIMITER}{}", currency.code);
+        log::debug!("Adding currency: {} to Redis", currency.code);
+        let payload = DatabaseQueries::serialize_payload(self.encoding, currency)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_currency command: {e}"))
     }
 
+    /// Persists an instrument definition to Redis.
+    ///
+    /// Stores as a STRING value under key `instruments:{instrument_id}`.
+    /// Serialized using the configured encoding (MsgPack or JSON).
     fn add_instrument(&self, instrument: &InstrumentAny) -> anyhow::Result<()> {
-        todo!()
+        let key = format!("{INSTRUMENTS}{REDIS_DELIMITER}{}", instrument.id());
+        log::debug!("Adding instrument: {} to Redis", instrument.id());
+        let payload = DatabaseQueries::serialize_payload(self.encoding, instrument)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_instrument command: {e}"))
     }
 
+    /// Persists a synthetic instrument definition to Redis.
+    ///
+    /// Stores as a STRING value under key `synthetics:{instrument_id}`.
+    /// Serialized using the configured encoding (MsgPack or JSON).
     fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
-        todo!()
+        let key = format!("{SYNTHETICS}{REDIS_DELIMITER}{}", synthetic.id);
+        log::debug!("Adding synthetic instrument: {} to Redis", synthetic.id);
+        let payload = DatabaseQueries::serialize_payload(self.encoding, synthetic)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_synthetic command: {e}"))
     }
 
     fn add_account(&self, account: &AccountAny) -> anyhow::Result<()> {
