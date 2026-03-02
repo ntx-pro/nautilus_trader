@@ -1566,8 +1566,159 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to send update_account command: {e}"))
     }
 
+    /// Appends the latest order event and updates state-dependent indexes.
+    ///
+    /// Called on every order state change. Performs these operations:
+    /// 1. Appends the new event to the order's event list (RPUSH_EXISTS)
+    /// 2. Updates venue order ID index if assigned (HSET)
+    /// 3. Manages inflight index based on event type (SADD/SREM)
+    /// 4. Manages open/closed indexes with exclusive transitions (SADD+SREM)
+    /// 5. Manages emulated index: removed on closed events (SREM)
+    ///
+    /// # State derivation from event types
+    ///
+    /// The Rust trait receives only `&OrderEventAny`, not the full `Order`.
+    /// State is derived from the event variant to mirror the in-memory cache:
+    /// - Inflight: Submitted, PendingCancel, PendingUpdate
+    /// - Open: Accepted, Triggered, PendingCancel, PendingUpdate
+    /// - Closed: Denied, Rejected, Canceled, Expired, Filled
+    ///
+    /// Note: `Filled` events are treated as closed. The `OrderFilled` struct
+    /// does not carry `leaves_qty`, so we cannot distinguish partial fills
+    /// from full fills. The in-memory cache (which has the full `Order`) is
+    /// the source of truth at runtime. On recovery, events are replayed and
+    /// order state is reconstructed correctly.
     fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()> {
-        todo!()
+        let client_order_id = order_event.client_order_id();
+        let client_order_id_bytes = Bytes::from(client_order_id.to_string());
+
+        log::debug!("Updating order: {client_order_id} in Redis");
+
+        // 1. Append event to order list (RPUSH_EXISTS)
+        let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
+        let payload = DatabaseQueries::serialize_payload(self.encoding, order_event)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Update,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send update_order command: {e}"))?;
+
+        // 2. Index venue order ID if present
+        if let Some(venue_order_id) = order_event.venue_order_id() {
+            self.index_venue_order_id(client_order_id, venue_order_id)?;
+        }
+
+        // 3. Derive state from event variant
+        let is_inflight = matches!(
+            order_event,
+            OrderEventAny::Submitted(_)
+                | OrderEventAny::PendingCancel(_)
+                | OrderEventAny::PendingUpdate(_)
+        );
+        let is_open = matches!(
+            order_event,
+            OrderEventAny::Accepted(_)
+                | OrderEventAny::Triggered(_)
+                | OrderEventAny::PendingCancel(_)
+                | OrderEventAny::PendingUpdate(_)
+        );
+        let is_closed = matches!(
+            order_event,
+            OrderEventAny::Denied(_)
+                | OrderEventAny::Rejected(_)
+                | OrderEventAny::Canceled(_)
+                | OrderEventAny::Expired(_)
+                | OrderEventAny::Filled(_)
+        );
+
+        // 4. Update inflight index
+        if is_inflight {
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Insert,
+                INDEX_ORDERS_INFLIGHT.to_string(),
+                Some(vec![client_order_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send inflight index insert: {e}"))?;
+        } else {
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Delete,
+                INDEX_ORDERS_INFLIGHT.to_string(),
+                Some(vec![client_order_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send inflight index delete: {e}"))?;
+        }
+
+        // 5. Update open/closed indexes (mutually exclusive)
+        if is_open {
+            // Remove from closed, add to open
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Delete,
+                INDEX_ORDERS_CLOSED.to_string(),
+                Some(vec![client_order_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send closed index delete: {e}"))?;
+
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Insert,
+                INDEX_ORDERS_OPEN.to_string(),
+                Some(vec![client_order_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send open index insert: {e}"))?;
+        } else if is_closed {
+            // Remove from open, add to closed
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Delete,
+                INDEX_ORDERS_OPEN.to_string(),
+                Some(vec![client_order_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send open index delete: {e}"))?;
+
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Insert,
+                INDEX_ORDERS_CLOSED.to_string(),
+                Some(vec![client_order_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send closed index insert: {e}"))?;
+        }
+
+        // 6. Update emulated index
+        // On Initialized: emulated index is handled by add_order (not update_order)
+        // On closed events: remove from emulated (mirrors in-memory: emulated if trigger && !closed)
+        if is_closed {
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Delete,
+                INDEX_ORDERS_EMULATED.to_string(),
+                Some(vec![client_order_id_bytes]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send emulated index delete: {e}"))?;
+        }
+
+        Ok(())
     }
 
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
