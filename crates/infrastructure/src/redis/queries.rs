@@ -670,11 +670,6 @@ impl DatabaseQueries {
         Ok(Some(synthetic))
     }
 
-    /// Loads a single account for `trader_key` and `account_id` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying read or deserialization fails.
     /// Loads an account by replaying all persisted events from the Redis list.
     ///
     /// The account's Redis list contains serialized [`AccountState`] entries
