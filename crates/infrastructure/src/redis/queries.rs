@@ -22,7 +22,7 @@ use futures::future::join_all;
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
-    events::{AccountState, order::any::OrderEventAny},
+    events::{AccountState, OrderFilled, order::any::OrderEventAny},
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::OrderAny,
@@ -813,11 +813,25 @@ impl DatabaseQueries {
         }
     }
 
-    /// Loads a single position for `trader_key` and `position_id` using the specified `encoding`.
+    /// Loads a single position by replaying all persisted fill events from the Redis list.
+    ///
+    /// The position's Redis list contains serialized [`OrderFilled`] entries
+    /// stored by [`add_position`] and [`update_position`]:
+    /// - `result[0]` is the initial fill that opened the position
+    /// - `result[1..]` are subsequent fills (partial closes, additions, etc.)
+    ///
+    /// Reconstruction mirrors the Cython `load_position` in `database.pyx`:
+    /// 1. Deserialize the first entry as `OrderFilled`
+    /// 2. Load the instrument from Redis using the fill's `instrument_id`
+    /// 3. Create `Position::new(&instrument, initial_fill)`
+    /// 4. Apply remaining fills via `position.apply(&fill)`
+    ///
+    /// Falls back to direct `Position` deserialization for backward
+    /// compatibility with data that may have been written in a different format.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying read or deserialization fails.
+    /// Returns an error if both event replay and fallback deserialization fail.
     pub async fn load_position(
         con: &ConnectionManager,
         trader_key: &str,
@@ -830,8 +844,52 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let position: Position = Self::deserialize_payload(encoding, &result[0])?;
-        Ok(Some(position))
+        // Try event replay first: deserialize each list entry as an OrderFilled
+        let fills_result: anyhow::Result<Vec<OrderFilled>> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect();
+
+        match fills_result {
+            Ok(fills) if !fills.is_empty() => {
+                let initial_fill = &fills[0];
+
+                // Load the instrument needed to construct the Position
+                let instrument = Self::load_instrument(
+                    con,
+                    trader_key,
+                    &initial_fill.instrument_id,
+                    encoding,
+                )
+                .await?;
+
+                let Some(instrument) = instrument else {
+                    anyhow::bail!(
+                        "Cannot load position {position_id}: \
+                         no instrument found for {}",
+                        initial_fill.instrument_id,
+                    );
+                };
+
+                let mut position = Position::new(&instrument, fills[0]);
+
+                for fill in &fills[1..] {
+                    position.apply(fill);
+                }
+
+                Ok(Some(position))
+            }
+            Err(_) => {
+                // Fallback: deserialize as full Position (legacy format)
+                log::debug!(
+                    "Deserializing position {position_id} from legacy format"
+                );
+                let position: Position =
+                    Self::deserialize_payload(encoding, &result[0])?;
+                Ok(Some(position))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn get_collection_key(key: &str) -> anyhow::Result<&str> {
