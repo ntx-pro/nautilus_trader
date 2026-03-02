@@ -149,6 +149,19 @@ impl NautilusKernel {
         RiskEngine::register_msgbus_handlers(risk_engine.clone());
         ExecutionEngine::register_msgbus_handlers(exec_engine.clone());
 
+        // Setup streaming to feather files (if configured)
+        #[cfg(feature = "streaming")]
+        if let Some(streaming_config) = config.streaming()
+            && let Err(e) = Self::setup_streaming(
+                &streaming_config,
+                clock.clone(),
+                config.environment(),
+                instance_id,
+            )
+        {
+            log::error!("Failed to setup streaming: {e}");
+        }
+
         let trader = Trader::new(
             config.trader_id(),
             instance_id,
@@ -257,6 +270,82 @@ impl NautilusKernel {
         let cache = Cache::new(Some(cache_config), cache_database);
 
         Rc::new(RefCell::new(cache))
+    }
+
+    /// Wires the Feather/Parquet streaming writer onto the message bus.
+    ///
+    /// Creates a [`FeatherWriter`] and subscribes it to all message bus topics
+    /// via the wildcard `"*"` pattern. Every supported data type (quotes, trades,
+    /// bars, order book deltas, etc.) published on the bus is automatically
+    /// streamed to feather files at the configured catalog path.
+    ///
+    /// This mirrors the Python kernel's `_setup_streaming()` behavior.
+    #[cfg(feature = "streaming")]
+    fn setup_streaming(
+        config: &crate::config::StreamingConfig,
+        clock: Rc<RefCell<dyn Clock>>,
+        environment: Environment,
+        instance_id: UUID4,
+    ) -> anyhow::Result<()> {
+        use nautilus_persistence::backend::feather::{
+            FeatherWriter, RotationConfig as FeatherRotation,
+        };
+        use nautilus_persistence::parquet::create_object_store_from_path;
+
+        let catalog_path = format!(
+            "{}/{}/{}",
+            config.catalog_path,
+            environment,
+            instance_id,
+        );
+
+        let (store, base_path, _scheme) = create_object_store_from_path(&catalog_path, None)?;
+
+        // Convert system RotationConfig to persistence RotationConfig.
+        // The two enums have the same variants for Size/Interval/NoRotation,
+        // but ScheduledDates differs (system lacks timezone). For ScheduledDates,
+        // fall back to NoRotation.
+        let rotation = match &config.rotation_config {
+            crate::config::RotationConfig::Size { max_size } => {
+                FeatherRotation::Size { max_size: *max_size }
+            }
+            crate::config::RotationConfig::Interval { interval_ns } => {
+                FeatherRotation::Interval { interval_ns: *interval_ns }
+            }
+            crate::config::RotationConfig::ScheduledDates { .. } => {
+                log::warn!("ScheduledDates rotation not supported in Rust streaming, using NoRotation");
+                FeatherRotation::NoRotation
+            }
+            crate::config::RotationConfig::NoRotation => FeatherRotation::NoRotation,
+        };
+
+        let writer = FeatherWriter::new(
+            base_path,
+            store,
+            clock,
+            rotation,
+            None,  // include all types
+            None,  // default per-instrument types
+            Some(config.flush_interval_ms),
+        );
+
+        // Subscribe to all message bus topics — fires on every published event.
+        // The handler is intentionally leaked (std::mem::forget) because the
+        // subscription must remain active for the lifetime of the kernel.
+        // The message bus cleans up subscriptions on shutdown.
+        let handler = FeatherWriter::subscribe_to_message_bus(
+            Rc::new(RefCell::new(writer)),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to subscribe streaming writer: {e}"))?;
+        std::mem::forget(handler);
+
+        log::info!(
+            "Streaming enabled: {} (flush={}ms)",
+            catalog_path,
+            config.flush_interval_ms,
+        );
+
+        Ok(())
     }
 
     fn cancel_timers(&self) {

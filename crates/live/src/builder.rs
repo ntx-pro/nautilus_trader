@@ -115,6 +115,16 @@ impl LiveNodeBuilder {
         self
     }
 
+    /// Set the streaming configuration for writing data to feather files.
+    ///
+    /// When set, the kernel subscribes a [`FeatherWriter`] to all message bus
+    /// topics, streaming market data and events to the configured catalog path.
+    #[must_use]
+    pub fn with_streaming(mut self, streaming: nautilus_system::config::StreamingConfig) -> Self {
+        self.config.streaming = Some(streaming);
+        self
+    }
+
     /// Set the connection timeout in seconds.
     #[must_use]
     pub const fn with_timeout_connection(mut self, timeout_secs: u64) -> Self {
