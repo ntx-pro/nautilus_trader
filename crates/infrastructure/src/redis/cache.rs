@@ -1046,12 +1046,45 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Returns an empty map because the Redis HASH `index:order_position`
+    /// stores only ID-to-ID mappings (`ClientOrderId` -> `PositionId`), not
+    /// full `Position` objects.  Reconstructing positions would require
+    /// loading each one individually which is expensive and unnecessary:
+    /// the in-memory cache rebuilds positions from event replay at startup.
     fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
-        todo!()
+        Ok(AHashMap::new())
     }
 
+    /// Loads the order-to-client index from Redis HASH `index:order_client`.
+    ///
+    /// Each entry maps a `ClientOrderId` to the `ClientId` of the execution
+    /// client that manages it.  Returns an empty map when the key does not
+    /// exist.
     fn load_index_order_client(&self) -> anyhow::Result<AHashMap<ClientOrderId, ClientId>> {
-        todo!()
+        let key = format!(
+            "{}{REDIS_DELIMITER}{INDEX_ORDER_CLIENT}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<std::collections::HashMap<String, String>, _> =
+                redis::cmd("HGETALL").arg(&key).query_async(&mut con).await;
+            let _ = tx.send(result);
+        });
+
+        let raw: std::collections::HashMap<String, String> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        let mut map = AHashMap::with_capacity(raw.len());
+        for (order_str, client_str) in raw {
+            let order_id = ClientOrderId::from(order_str.as_str());
+            let client_id = ClientId::from(client_str.as_str());
+            map.insert(order_id, client_id);
+        }
+        Ok(map)
     }
 
     async fn load_currency(&self, code: &Ustr) -> anyhow::Result<Option<Currency>> {
@@ -1123,20 +1156,95 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Loads actor state from Redis.
+    ///
+    /// Reads a STRING value at key `actors:{component_id}:state`, deserializes
+    /// it from the configured encoding into a map of state key-value pairs.
+    /// Returns an empty map when no state has been persisted.
     fn load_actor(&self, component_id: &ComponentId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        todo!()
+        let key = format!(
+            "{}{REDIS_DELIMITER}{ACTORS}{REDIS_DELIMITER}{component_id}{REDIS_DELIMITER}state",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<u8>, _> = redis::cmd("GET").arg(&key).query_async(&mut con).await;
+            let _ = tx.send(result);
+        });
+
+        let raw: Vec<u8> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        if raw.is_empty() {
+            return Ok(AHashMap::new());
+        }
+
+        let state: AHashMap<String, Bytes> =
+            DatabaseQueries::deserialize_payload(self.encoding, &raw)?;
+        Ok(state)
     }
 
+    /// Deletes actor state from Redis.
+    ///
+    /// Removes the STRING key `actors:{component_id}:state` via the
+    /// background write channel.
     fn delete_actor(&self, component_id: &ComponentId) -> anyhow::Result<()> {
-        todo!()
+        let key = format!("{ACTORS}{REDIS_DELIMITER}{component_id}{REDIS_DELIMITER}state");
+        log::debug!("Deleting actor state: {component_id} from Redis");
+        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send delete_actor command: {e}"))
     }
 
+    /// Loads strategy state from Redis.
+    ///
+    /// Reads a STRING value at key `strategies:{strategy_id}:state`,
+    /// deserializes it from the configured encoding into a map of state
+    /// key-value pairs.  Returns an empty map when no state has been
+    /// persisted.
     fn load_strategy(&self, strategy_id: &StrategyId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        todo!()
+        let key = format!(
+            "{}{REDIS_DELIMITER}{STRATEGIES}{REDIS_DELIMITER}{strategy_id}{REDIS_DELIMITER}state",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<u8>, _> = redis::cmd("GET").arg(&key).query_async(&mut con).await;
+            let _ = tx.send(result);
+        });
+
+        let raw: Vec<u8> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        if raw.is_empty() {
+            return Ok(AHashMap::new());
+        }
+
+        let state: AHashMap<String, Bytes> =
+            DatabaseQueries::deserialize_payload(self.encoding, &raw)?;
+        Ok(state)
     }
 
+    /// Deletes strategy state from Redis.
+    ///
+    /// Removes the STRING key `strategies:{strategy_id}:state` via the
+    /// background write channel.
     fn delete_strategy(&self, component_id: &StrategyId) -> anyhow::Result<()> {
-        todo!()
+        let key = format!("{STRATEGIES}{REDIS_DELIMITER}{component_id}{REDIS_DELIMITER}state");
+        log::debug!("Deleting strategy state: {component_id} from Redis");
+        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send delete_strategy command: {e}"))
     }
 
     fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
@@ -1407,8 +1515,27 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         Ok(())
     }
 
+    /// Persists a pre-built order snapshot to Redis.
+    ///
+    /// Serializes the `OrderSnapshot` and appends it (RPUSH) to the LIST
+    /// at key `snapshots:orders:{client_order_id}`.  Multiple snapshots
+    /// for the same order accumulate as a time-series of state.
     fn add_order_snapshot(&self, snapshot: &OrderSnapshot) -> anyhow::Result<()> {
-        todo!()
+        let client_order_id = &snapshot.client_order_id;
+        let key = format!(
+            "{SNAPSHOTS}{REDIS_DELIMITER}{ORDERS}{REDIS_DELIMITER}{client_order_id}",
+        );
+        log::debug!("Adding order snapshot: {client_order_id} to Redis");
+        let payload = DatabaseQueries::serialize_payload(self.encoding, snapshot)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_order_snapshot command: {e}"))
     }
 
     /// Persists a position's initial fill event and updates position indexes.
@@ -1476,8 +1603,27 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to send position open index command: {e}"))
     }
 
+    /// Persists a pre-built position snapshot to Redis.
+    ///
+    /// Serializes the `PositionSnapshot` and appends it (RPUSH) to the LIST
+    /// at key `snapshots:positions:{position_id}`.  Multiple snapshots
+    /// for the same position accumulate as a time-series of state.
     fn add_position_snapshot(&self, snapshot: &PositionSnapshot) -> anyhow::Result<()> {
-        todo!()
+        let position_id = &snapshot.position_id;
+        let key = format!(
+            "{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}",
+        );
+        log::debug!("Adding position snapshot: {position_id} to Redis");
+        let payload = DatabaseQueries::serialize_payload(self.encoding, snapshot)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_position_snapshot command: {e}"))
     }
 
     fn add_order_book(&self, order_book: &OrderBook) -> anyhow::Result<()> {
@@ -1595,12 +1741,21 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to send index_order_position command: {e}"))
     }
 
+    /// No-op: the Rust trait signature has no parameters so there is no
+    /// actor state to persist.  In the Cython implementation, the `Actor`
+    /// object is passed and its `save()` dict is serialized.  The Rust
+    /// trait will need to be updated to accept a state payload before this
+    /// method can do real work.
     fn update_actor(&self) -> anyhow::Result<()> {
-        todo!()
+        log::debug!("update_actor called (no-op: trait has no state parameter)");
+        Ok(())
     }
 
+    /// No-op: the Rust trait signature has no parameters so there is no
+    /// strategy state to persist.  See `update_actor` for rationale.
     fn update_strategy(&self) -> anyhow::Result<()> {
-        todo!()
+        log::debug!("update_strategy called (no-op: trait has no state parameter)");
+        Ok(())
     }
 
     /// Updates an account state in Redis by appending the latest event.
@@ -1866,16 +2021,44 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         Ok(())
     }
 
+    /// Creates a point-in-time snapshot of an order's full state.
+    ///
+    /// Converts the `OrderAny` to an `OrderSnapshot`, serializes it, and
+    /// appends (RPUSH) to the LIST at `snapshots:orders:{client_order_id}`.
+    /// This mirrors the Cython `snapshot_order_state` which serializes
+    /// `order.to_dict()`.
     fn snapshot_order_state(&self, order: &OrderAny) -> anyhow::Result<()> {
-        todo!()
+        let snapshot = OrderSnapshot::from(order.clone());
+        self.add_order_snapshot(&snapshot)
     }
 
+    /// Creates a point-in-time snapshot of a position's full state.
+    ///
+    /// Converts the `Position` to a `PositionSnapshot` (with no unrealized
+    /// PnL — the trait does not provide it), serializes it, and appends
+    /// (RPUSH) to the LIST at `snapshots:positions:{position_id}`.
     fn snapshot_position_state(&self, position: &Position) -> anyhow::Result<()> {
-        todo!()
+        let snapshot = PositionSnapshot::from(position, None);
+        self.add_position_snapshot(&snapshot)
     }
 
+    /// Writes a heartbeat timestamp to Redis.
+    ///
+    /// Stores the timestamp as a STRING at key `health:heartbeat`.
+    /// Each heartbeat overwrites the previous value (SET, not RPUSH).
     fn heartbeat(&self, timestamp: UnixNanos) -> anyhow::Result<()> {
-        todo!()
+        let key = format!("{HEALTH}{REDIS_DELIMITER}heartbeat");
+        let ts_str = timestamp.to_string();
+        log::debug!("Heartbeat: {ts_str}");
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(ts_str.into_bytes())]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send heartbeat command: {e}"))
     }
 }
 
