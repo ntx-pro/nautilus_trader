@@ -25,7 +25,7 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     accounts::AccountAny,
     data::{Bar, DataType, FundingRateUpdate, GreeksData, QuoteTick, TradeTick, YieldCurveData},
-    events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
+    events::{OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
         AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
         VenueOrderId,
@@ -492,12 +492,16 @@ pub trait CacheDatabaseAdapter {
     /// Returns an error if updating an account fails.
     fn update_account(&self, account: &AccountAny) -> anyhow::Result<()>;
 
-    /// Updates an order in the cache with an order event.
+    /// Updates an order in the cache.
+    ///
+    /// Receives the full `OrderAny` so that implementors can query order state
+    /// (e.g. `is_open()`, `is_closed()`, `is_inflight()`) for accurate index
+    /// management.
     ///
     /// # Errors
     ///
     /// Returns an error if updating an order fails.
-    fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()>;
+    fn update_order(&self, order: &OrderAny) -> anyhow::Result<()>;
 
     /// Updates a position in the cache.
     ///
