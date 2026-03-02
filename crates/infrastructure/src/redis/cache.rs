@@ -977,15 +977,19 @@ pub struct RedisCacheDatabaseAdapter {
 
 #[async_trait::async_trait]
 impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
+    /// Closes the Redis cache database connection and background writer task.
     fn close(&mut self) -> anyhow::Result<()> {
         self.database.close();
         Ok(())
     }
 
+    /// Flushes all data from the Redis database (FLUSHDB).
     fn flush(&mut self) -> anyhow::Result<()> {
         self.database.flushdb_sync()
     }
 
+    /// Loads all cached data concurrently: currencies, instruments, synthetics,
+    /// accounts, orders, positions, greeks, and yield curves.
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
         log::debug!("Loading all data");
 
@@ -1022,11 +1026,13 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         })
     }
 
+    /// Loads all general key-value state from Redis. Currently returns empty map (TODO).
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
         // self.database.load()
         Ok(AHashMap::new()) // TODO
     }
 
+    /// Delegates to [`DatabaseQueries::load_currencies`] to scan and deserialize all persisted currencies.
     async fn load_currencies(&self) -> anyhow::Result<AHashMap<Ustr, Currency>> {
         DatabaseQueries::load_currencies(
             &self.database.con,
@@ -1036,6 +1042,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_instruments`] to scan and deserialize all persisted instruments.
     async fn load_instruments(&self) -> anyhow::Result<AHashMap<InstrumentId, InstrumentAny>> {
         DatabaseQueries::load_instruments(
             &self.database.con,
@@ -1045,6 +1052,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_synthetics`] to scan and deserialize all persisted synthetics.
     async fn load_synthetics(&self) -> anyhow::Result<AHashMap<InstrumentId, SyntheticInstrument>> {
         DatabaseQueries::load_synthetics(
             &self.database.con,
@@ -1054,16 +1062,19 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_accounts`] to scan and deserialize all persisted accounts.
     async fn load_accounts(&self) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
         DatabaseQueries::load_accounts(&self.database.con, &self.database.trader_key, self.encoding)
             .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_orders`] to scan and deserialize all persisted orders.
     async fn load_orders(&self) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
         DatabaseQueries::load_orders(&self.database.con, &self.database.trader_key, self.encoding)
             .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_positions`] to scan and deserialize all persisted positions.
     async fn load_positions(&self) -> anyhow::Result<AHashMap<PositionId, Position>> {
         DatabaseQueries::load_positions(
             &self.database.con,
@@ -1114,6 +1125,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         Ok(map)
     }
 
+    /// Delegates to [`DatabaseQueries::load_currency`] to load a single currency by code.
     async fn load_currency(&self, code: &Ustr) -> anyhow::Result<Option<Currency>> {
         DatabaseQueries::load_currency(
             &self.database.con,
@@ -1124,6 +1136,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_instrument`] to load a single instrument by ID.
     async fn load_instrument(
         &self,
         instrument_id: &InstrumentId,
@@ -1137,6 +1150,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_synthetic`] to load a single synthetic instrument by ID.
     async fn load_synthetic(
         &self,
         instrument_id: &InstrumentId,
@@ -1150,6 +1164,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_account`] to load a single account by ID.
     async fn load_account(&self, account_id: &AccountId) -> anyhow::Result<Option<AccountAny>> {
         DatabaseQueries::load_account(
             &self.database.con,
@@ -1160,6 +1175,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_order`] to load a single order by client order ID.
     async fn load_order(
         &self,
         client_order_id: &ClientOrderId,
@@ -1173,6 +1189,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         .await
     }
 
+    /// Delegates to [`DatabaseQueries::load_position`] to load a single position by ID.
     async fn load_position(&self, position_id: &PositionId) -> anyhow::Result<Option<Position>> {
         DatabaseQueries::load_position(
             &self.database.con,
@@ -1274,11 +1291,16 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to send delete_strategy command: {e}"))
     }
 
+    /// Delegates to [`RedisCacheDatabase::delete_order`] which removes the order and
+    /// cleans up all associated indexes (orders, open, closed, emulated, inflight,
+    /// order_position, order_client).
     fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
         log::debug!("Deleting order: {client_order_id} from Redis");
         self.database.delete_order(client_order_id)
     }
 
+    /// Delegates to [`RedisCacheDatabase::delete_position`] which removes the position
+    /// and cleans up all associated indexes.
     fn delete_position(&self, position_id: &PositionId) -> anyhow::Result<()> {
         log::debug!("Deleting position: {position_id} from Redis");
         self.database.delete_position(position_id)
@@ -1314,6 +1336,11 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     ///
     /// Stores as a STRING value under key `currencies:{code}`.
     /// Serialized using the configured encoding (MsgPack or JSON).
+    ///
+    /// Note: The Rust `Currency` type serializes only the code string (e.g., "USD")
+    /// via a custom `Serialize` impl. The Cython implementation writes a full dict
+    /// with `{precision, iso4217, name, currency_type}`. Rust-to-Rust round-trips
+    /// work correctly via `CURRENCY_MAP` lookup on deserialization.
     fn add_currency(&self, currency: &Currency) -> anyhow::Result<()> {
         let key = format!("{CURRENCIES}{REDIS_DELIMITER}{}", currency.code);
         log::debug!("Adding currency: {} to Redis", currency.code);
@@ -2300,6 +2327,10 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .send(op)
             .map_err(|e| anyhow::anyhow!("Failed to send update_position command: {e}"))?;
 
+        // Note: The Cython implementation (database.pyx) reuses serialized event bytes
+        // for index SADD/SREM operations, which is incorrect — indexes should contain
+        // position ID strings. This implementation correctly uses position_id_bytes.
+
         // Index: open/closed state (mutually exclusive)
         if position.is_open() {
             let op = DatabaseCommand::new(
@@ -2377,6 +2408,9 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     ///
     /// Stores the timestamp as a STRING at key `health:heartbeat`.
     /// Each heartbeat overwrites the previous value (SET, not RPUSH).
+    ///
+    /// Note: Stores timestamp as `UnixNanos.to_string()` (integer nanoseconds string).
+    /// The Cython implementation uses ISO8601 format via `format_iso8601()`.
     fn heartbeat(&self, timestamp: UnixNanos) -> anyhow::Result<()> {
         let key = format!("{HEALTH}{REDIS_DELIMITER}heartbeat");
         let ts_str = timestamp.to_string();
