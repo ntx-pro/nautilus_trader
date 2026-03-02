@@ -33,8 +33,12 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{
-        Bar, Data, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
+        Bar, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta,
+        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
+    },
+    events::{
+        AccountState, OrderAccepted, OrderCanceled, OrderFilled, OrderRejected, PositionChanged,
+        PositionClosed, PositionOpened,
     },
     instruments::InstrumentAny,
 };
@@ -593,9 +597,11 @@ impl FeatherWriter {
 
     /// Subscribes to all messages on the message bus (pattern "*").
     ///
-    /// This will automatically write all supported data types that are published
-    /// on the message bus to the feather files. FundingRateUpdate is intentionally
-    /// not written; messages of that type are ignored (no downcast handler).
+    /// This will automatically write all supported data and event types that are
+    /// published on the message bus to the feather files. Supported types include
+    /// market data (quotes, trades, bars, order book, etc.), instruments, execution
+    /// events (order fills, accepts, cancels, rejects), position events, account
+    /// state, and funding rate updates.
     ///
     /// The writer must be wrapped in `Rc<RefCell<>>` to be shareable with the message bus handler.
     ///
@@ -667,8 +673,54 @@ impl FeatherWriter {
                 if let Err(e) = runtime.block_on(writer.write_instrument(instrument.clone())) {
                     log::warn!("Failed to write InstrumentAny: {e}");
                 }
+            // Execution events (D-009: 100% data capture)
+            } else if let Some(event) = message.downcast_ref::<OrderFilled>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderFilled: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderAccepted>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderAccepted: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderCanceled>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderCanceled: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<OrderRejected>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write OrderRejected: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<PositionOpened>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(event.clone())) {
+                    log::warn!("Failed to write PositionOpened: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<PositionChanged>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(event.clone())) {
+                    log::warn!("Failed to write PositionChanged: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<PositionClosed>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(event.clone())) {
+                    log::warn!("Failed to write PositionClosed: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<AccountState>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(event.clone())) {
+                    log::warn!("Failed to write AccountState: {e}");
+                }
+            } else if let Some(event) = message.downcast_ref::<FundingRateUpdate>() {
+                let mut writer = writer.borrow_mut();
+                if let Err(e) = runtime.block_on(writer.write(*event)) {
+                    log::warn!("Failed to write FundingRateUpdate: {e}");
+                }
             }
-            // Silently ignore other message types (events, commands, etc.)
+            // Silently ignore other message types (commands, signals, etc.)
         });
 
         // Subscribe to all messages using wildcard pattern
