@@ -744,7 +744,7 @@ fn insert_index(pipe: &mut Pipeline, key: &str, value: &[Bytes]) -> anyhow::Resu
     let index_key = get_index_key(key)?;
     match index_key {
         INDEX_ORDER_IDS => {
-            insert_set(pipe, key, value[0].as_ref());
+            insert_hset(pipe, key, value[0].as_ref(), value[1].as_ref());
             Ok(())
         }
         INDEX_ORDER_POSITION => {
@@ -885,7 +885,7 @@ fn delete_from_index(
 
     match index_key {
         INDEX_ORDER_IDS => {
-            remove_from_set(pipe, key, value[0].as_ref());
+            remove_from_hash(pipe, key, value[0].as_ref());
             Ok(())
         }
         INDEX_ORDER_POSITION => {

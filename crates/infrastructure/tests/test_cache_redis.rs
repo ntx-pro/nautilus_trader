@@ -247,7 +247,6 @@ mod serial_tests {
 
         // Add to various indexes
         let index_keys = [
-            format!("{trader_key}:index:order_ids"),
             format!("{trader_key}:index:orders"),
             format!("{trader_key}:index:orders_open"),
             format!("{trader_key}:index:orders_closed"),
@@ -262,6 +261,7 @@ mod serial_tests {
 
         // Add to hash-based indexes
         let hash_keys = [
+            format!("{trader_key}:index:order_ids"),
             format!("{trader_key}:index:order_position"),
             format!("{trader_key}:index:order_client"),
         ];
