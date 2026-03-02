@@ -61,7 +61,7 @@ use nautilus_model::{
     accounts::AccountAny,
     data::{Bar, DataType, FundingRateUpdate, QuoteTick, TradeTick},
     enums::TriggerType,
-    events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
+    events::{OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
         AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
         TraderId, VenueOrderId,
@@ -2162,49 +2162,31 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     /// Appends the latest order event and updates state-dependent indexes.
+    /// Appends the latest order event and updates state-dependent indexes.
     ///
     /// Called on every order state change. Performs these operations:
     /// 1. Appends the new event to the order's event list (RPUSH_EXISTS)
     /// 2. Updates venue order ID index if assigned (HSET)
-    /// 3. Manages inflight index based on event type (SADD/SREM)
-    /// 4. Manages open/closed indexes with exclusive transitions (SADD+SREM)
-    /// 5. Manages emulated index: removed on closed events (SREM)
+    /// 3. Manages inflight index via `order.is_inflight()` (SADD/SREM)
+    /// 4. Manages open/closed indexes via `order.is_open()`/`order.is_closed()` (SADD+SREM)
+    /// 5. Manages emulated index via `order.emulation_trigger()` (SADD/SREM)
     ///
-    /// # State derivation from event types
-    ///
-    /// The Rust trait receives only `&OrderEventAny`, not the full `Order`.
-    /// State is derived from the event variant to mirror the in-memory cache:
-    /// - Inflight: Submitted, PendingCancel, PendingUpdate
-    /// - Open: Accepted, Triggered, PendingCancel, PendingUpdate
-    /// - Closed: Denied, Rejected, Canceled, Expired, Filled
-    ///
-    /// # Partial fill limitation
-    ///
-    /// `OrderEventAny::Filled` is used for both partial and full fills.
-    /// The `OrderFilled` struct does not carry `leaves_qty`, so we cannot
-    /// distinguish partial fills from full fills at the event level. All
-    /// `Filled` events are treated as closed, which causes incorrect index
-    /// state for partially filled orders (they will appear in
-    /// `index:orders_closed` while still being active).
-    ///
-    /// This is acceptable because:
-    /// - The in-memory cache (which has the full `Order` with `is_open()`
-    ///   / `is_closed()`) remains the runtime source of truth.
-    /// - On recovery, events are replayed in order and the final order
-    ///   state is reconstructed correctly from the event sequence.
-    ///
-    /// Proposed enhancement: change the trait to pass `&OrderAny` instead
-    /// of `&OrderEventAny`, enabling `order.is_open()` / `order.is_closed()`
-    /// for accurate index management.
-    fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()> {
-        let client_order_id = order_event.client_order_id();
-        let client_order_id_bytes = Bytes::from(client_order_id.to_string());
+    /// Receives the full `OrderAny`, enabling accurate state queries for index
+    /// management. Uses `order.is_open()`, `order.is_closed()`, `order.is_inflight()`,
+    /// and `order.emulation_trigger()` to determine index transitions, matching
+    /// the behavior of the in-memory Cache and the Cython adapter. This correctly
+    /// handles partial fills (which remain open, not closed).
+    fn update_order(&self, order: &OrderAny) -> anyhow::Result<()> {
+        let client_order_id = order.client_order_id();
+        let client_order_id_str = client_order_id.to_string();
+        let client_order_id_bytes = Bytes::from(client_order_id_str);
+        let event = order.last_event();
 
         log::debug!("Updating order: {client_order_id} in Redis");
 
         // 1. Append event to order list (RPUSH_EXISTS)
         let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
-        let payload = DatabaseQueries::serialize_payload(self.encoding, order_event)?;
+        let payload = DatabaseQueries::serialize_payload(self.encoding, event)?;
         let op = DatabaseCommand::new(
             DatabaseOperation::Update,
             key,
@@ -2215,36 +2197,13 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .send(op)
             .map_err(|e| anyhow::anyhow!("Failed to send update_order command: {e}"))?;
 
-        // 2. Index venue order ID if present
-        if let Some(venue_order_id) = order_event.venue_order_id() {
+        // 2. Index venue order ID if assigned
+        if let Some(venue_order_id) = order.venue_order_id() {
             self.index_venue_order_id(client_order_id, venue_order_id)?;
         }
 
-        // 3. Derive state from event variant
-        let is_inflight = matches!(
-            order_event,
-            OrderEventAny::Submitted(_)
-                | OrderEventAny::PendingCancel(_)
-                | OrderEventAny::PendingUpdate(_)
-        );
-        let is_open = matches!(
-            order_event,
-            OrderEventAny::Accepted(_)
-                | OrderEventAny::Triggered(_)
-                | OrderEventAny::PendingCancel(_)
-                | OrderEventAny::PendingUpdate(_)
-        );
-        let is_closed = matches!(
-            order_event,
-            OrderEventAny::Denied(_)
-                | OrderEventAny::Rejected(_)
-                | OrderEventAny::Canceled(_)
-                | OrderEventAny::Expired(_)
-                | OrderEventAny::Filled(_)
-        );
-
-        // 4. Update inflight index
-        if is_inflight {
+        // 3. Inflight index (order.is_inflight() checks status + emulation trigger)
+        if order.is_inflight() {
             let op = DatabaseCommand::new(
                 DatabaseOperation::Insert,
                 INDEX_ORDERS_INFLIGHT.to_string(),
@@ -2253,7 +2212,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             self.database
                 .tx
                 .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send inflight index insert: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Failed to send inflight index command: {e}"))?;
         } else {
             let op = DatabaseCommand::new(
                 DatabaseOperation::Delete,
@@ -2263,12 +2222,11 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             self.database
                 .tx
                 .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send inflight index delete: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Failed to send inflight index remove: {e}"))?;
         }
 
-        // 5. Update open/closed indexes (mutually exclusive)
-        if is_open {
-            // Remove from closed, add to open
+        // 4. Open/closed indexes (mutually exclusive, order.is_open() handles partial fills correctly)
+        if order.is_open() {
             let op = DatabaseCommand::new(
                 DatabaseOperation::Delete,
                 INDEX_ORDERS_CLOSED.to_string(),
@@ -2277,8 +2235,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             self.database
                 .tx
                 .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send closed index delete: {e}"))?;
-
+                .map_err(|e| anyhow::anyhow!("Failed to send closed index remove: {e}"))?;
             let op = DatabaseCommand::new(
                 DatabaseOperation::Insert,
                 INDEX_ORDERS_OPEN.to_string(),
@@ -2287,9 +2244,8 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             self.database
                 .tx
                 .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send open index insert: {e}"))?;
-        } else if is_closed {
-            // Remove from open, add to closed
+                .map_err(|e| anyhow::anyhow!("Failed to send open index command: {e}"))?;
+        } else if order.is_closed() {
             let op = DatabaseCommand::new(
                 DatabaseOperation::Delete,
                 INDEX_ORDERS_OPEN.to_string(),
@@ -2298,8 +2254,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             self.database
                 .tx
                 .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send open index delete: {e}"))?;
-
+                .map_err(|e| anyhow::anyhow!("Failed to send open index remove: {e}"))?;
             let op = DatabaseCommand::new(
                 DatabaseOperation::Insert,
                 INDEX_ORDERS_CLOSED.to_string(),
@@ -2308,22 +2263,32 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             self.database
                 .tx
                 .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send closed index insert: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Failed to send closed index command: {e}"))?;
         }
 
-        // 6. Update emulated index
-        // On Initialized: emulated index is handled by add_order (not update_order)
-        // On closed events: remove from emulated (mirrors in-memory: emulated if trigger && !closed)
-        if is_closed {
-            let op = DatabaseCommand::new(
-                DatabaseOperation::Delete,
-                INDEX_ORDERS_EMULATED.to_string(),
-                Some(vec![client_order_id_bytes]),
-            );
-            self.database
-                .tx
-                .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send emulated index delete: {e}"))?;
+        // 5. Emulated index (uses full order state, matching Cython behavior)
+        if let Some(trigger) = order.emulation_trigger() {
+            if trigger != TriggerType::NoTrigger && !order.is_closed() {
+                let op = DatabaseCommand::new(
+                    DatabaseOperation::Insert,
+                    INDEX_ORDERS_EMULATED.to_string(),
+                    Some(vec![client_order_id_bytes]),
+                );
+                self.database
+                    .tx
+                    .send(op)
+                    .map_err(|e| anyhow::anyhow!("Failed to send emulated index: {e}"))?;
+            } else {
+                let op = DatabaseCommand::new(
+                    DatabaseOperation::Delete,
+                    INDEX_ORDERS_EMULATED.to_string(),
+                    Some(vec![client_order_id_bytes]),
+                );
+                self.database
+                    .tx
+                    .send(op)
+                    .map_err(|e| anyhow::anyhow!("Failed to send emulated index remove: {e}"))?;
+            }
         }
 
         Ok(())

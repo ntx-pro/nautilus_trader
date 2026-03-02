@@ -946,8 +946,8 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         })
     }
 
-    fn update_order(&self, event: &OrderEventAny) -> anyhow::Result<()> {
-        let query = DatabaseQuery::UpdateOrder(event.clone());
+    fn update_order(&self, order: &OrderAny) -> anyhow::Result<()> {
+        let query = DatabaseQuery::UpdateOrder(order.last_event().clone());
         self.tx.send(query).map_err(|e| {
             anyhow::anyhow!("Failed to send query update_order to database message handler: {e}")
         })

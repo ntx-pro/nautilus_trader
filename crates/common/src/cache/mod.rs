@@ -2076,7 +2076,7 @@ impl Cache {
         }
 
         if let Some(database) = &mut self.database {
-            database.update_order(order.last_event())?;
+            database.update_order(order)?;
             // TODO: Implement order snapshots
             // if self.snapshot_orders {
             //     database.snapshot_order_state(order)?;
