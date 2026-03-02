@@ -27,6 +27,7 @@ from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
+from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.model.data import QuoteTick
@@ -76,12 +77,6 @@ def exec_client_builder(
             return_value="0x1234567890abcdef1234567890abcdef12345678",
         )
         mock_http_client.get_spot_fill_coin_mapping = MagicMock(return_value={})
-        mock_http_client.builder_maker_tenths_bp = MagicMock(return_value=4)
-        mock_http_client.builder_taker_tenths_bp = MagicMock(return_value=10)
-        mock_http_client.update_builder_fees = MagicMock(return_value=((4, 4), (10, 10)))
-        mock_http_client.info_user_fees = AsyncMock(
-            return_value='{"userAddRate": "0.00015", "userCrossRate": "0.00035"}',
-        )
         mock_instrument_provider.initialize.reset_mock()
         mock_instrument_provider.instruments_pyo3.reset_mock()
         mock_instrument_provider.instruments_pyo3.return_value = []
@@ -923,5 +918,237 @@ async def test_submit_order_list_calls_batch_path(
         # Assert - batch path calls submit_orders, not submit_order
         http_client.submit_orders.assert_awaited_once()
         http_client.submit_order.assert_not_awaited()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modify_limit_order(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-123456"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00100"),
+        price=Price.from_str("50000.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    cache.add_order(order, None)
+
+    command = ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("12345"),
+        quantity=Quantity.from_str("0.00200"),
+        price=Price.from_str("51000.0"),
+        trigger_price=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    try:
+        # Act
+        await client._modify_order(command)
+
+        # Assert
+        http_client.modify_order.assert_awaited_once()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modify_order_rejected_when_not_in_cache(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    command = ModifyOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-UNKNOWN"),
+        venue_order_id=VenueOrderId("12345"),
+        quantity=Quantity.from_str("0.00200"),
+        price=Price.from_str("51000.0"),
+        trigger_price=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    try:
+        # Act
+        await client._modify_order(command)
+
+        # Assert - rejected, no HTTP call
+        http_client.modify_order.assert_not_awaited()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modify_order_rejected_when_no_venue_order_id(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-123456"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00100"),
+        price=Price.from_str("50000.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    cache.add_order(order, None)
+
+    # No venue_order_id on order or command
+    command = ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=None,
+        quantity=Quantity.from_str("0.00200"),
+        price=Price.from_str("51000.0"),
+        trigger_price=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    try:
+        # Act
+        await client._modify_order(command)
+
+        # Assert - rejected, no HTTP call
+        http_client.modify_order.assert_not_awaited()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modify_stop_market_uses_trigger_price_as_fallback(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    StopMarket has no limit price; trigger_price is used as the price field.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-STOP-001"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("0.00100"),
+        trigger_price=Price.from_str("95000.0"),
+        trigger_type=TriggerType.LAST_PRICE,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    cache.add_order(order, None)
+
+    command = ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("12345"),
+        quantity=Quantity.from_str("0.00200"),
+        price=None,
+        trigger_price=Price.from_str("94000.0"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    try:
+        # Act
+        await client._modify_order(command)
+
+        # Assert
+        http_client.modify_order.assert_awaited_once()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modify_order_rejection_on_http_error(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    http_client.modify_order.side_effect = Exception("Modify rejected: Invalid order")
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-123456"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00100"),
+        price=Price.from_str("50000.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    cache.add_order(order, None)
+
+    command = ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("12345"),
+        quantity=Quantity.from_str("0.00200"),
+        price=Price.from_str("51000.0"),
+        trigger_price=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    try:
+        # Act - should not raise
+        await client._modify_order(command)
+
+        # Assert - rejection handled internally
+        http_client.modify_order.assert_awaited_once()
     finally:
         await client._disconnect()

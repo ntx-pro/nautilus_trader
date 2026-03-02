@@ -136,7 +136,7 @@ chrono-tz = "0.10.4"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 ctrlc = "3.5.2"
 dashmap = "6.1.0"
-datafusion = { version = "52.1.0", default-features = false, features = [
+datafusion = { version = "52.2.0", default-features = false, features = [
   "parquet",
   "regex_expressions",
   "unicode_expressions",
@@ -346,7 +346,7 @@ iai = "0.1.1"
 pretty_assertions = "1.4.1"
 proptest = { version = "1.10.0", default-features = false, features = ["std"] }
 rstest = "0.26.1"
-tempfile = "3.25.0"
+tempfile = "3.26.0"
 turmoil = "0.7.1"
 
 # -----------------------------------------------------------------------------
@@ -489,7 +489,14 @@ redundant_closure = "warn"
 collapsible_if = "warn"
 collapsible_else_if = "warn"
 useless_conversion = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_self_imports = "warn"
+unnecessary_semicolon = "warn"
 unnecessary_sort_by = "warn"
+unnecessary_struct_initialization = "warn"
+# unnecessary_debug_formatting = "warn" # TODO: Enable (~49 warnings)
+# unnecessary_wraps = "warn" # TODO: Enable (~73 warnings)
 from_iter_instead_of_collect = "warn"
 map_identity = "warn"
 if_same_then_else = "warn"

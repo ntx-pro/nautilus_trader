@@ -22,6 +22,7 @@ use futures::future::join_all;
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
+    events::{AccountState, OrderFilled, order::any::OrderEventAny},
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::OrderAny,
@@ -329,11 +330,6 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading instrument data fails.
-    /// Loads all instruments for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading instrument data fails.
     pub async fn load_instruments(
         con: &ConnectionManager,
         trader_key: &str,
@@ -393,11 +389,6 @@ impl DatabaseQueries {
         Ok(instruments)
     }
 
-    /// Loads all synthetic instruments for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading synthetic instrument data fails.
     /// Loads all synthetic instruments for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
@@ -467,11 +458,6 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading account data fails.
-    /// Loads all accounts for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading account data fails.
     pub async fn load_accounts(
         con: &ConnectionManager,
         trader_key: &str,
@@ -523,11 +509,6 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading order data fails.
-    /// Loads all orders for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading order data fails.
     pub async fn load_orders(
         con: &ConnectionManager,
         trader_key: &str,
@@ -574,11 +555,6 @@ impl DatabaseQueries {
         Ok(orders)
     }
 
-    /// Loads all positions for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading position data fails.
     /// Loads all positions for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
@@ -694,11 +670,20 @@ impl DatabaseQueries {
         Ok(Some(synthetic))
     }
 
-    /// Loads a single account for `trader_key` and `account_id` using the specified `encoding`.
+    /// Loads an account by replaying all persisted events from the Redis list.
+    ///
+    /// The account's Redis list contains serialized [`AccountState`] entries
+    /// stored by [`add_account`] and [`update_account`]:
+    /// - `result[0]` is the initial account state
+    /// - `result[1..]` are subsequent state updates
+    ///
+    /// Reconstructs the full account via [`AccountAny::from_events()`].
+    /// Falls back to direct deserialization for backward compatibility.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying read or deserialization fails.
+    /// Returns an error if reading from Redis fails or if event deserialization
+    /// and replay both fail (including the legacy fallback path).
     pub async fn load_account(
         con: &ConnectionManager,
         trader_key: &str,
@@ -711,15 +696,58 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let account: AccountAny = Self::deserialize_payload(encoding, &result[0])?;
-        Ok(Some(account))
+        // Try event replay first (current write format)
+        let events_result: anyhow::Result<Vec<AccountState>> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect();
+
+        match events_result {
+            Ok(events) if !events.is_empty() => {
+                match AccountAny::from_events(events) {
+                    Ok(account) => Ok(Some(account)),
+                    Err(e) => {
+                        log::warn!(
+                            "Account event replay failed for {account_id}, \
+                             trying direct deserialization: {e}"
+                        );
+                        let account: AccountAny =
+                            Self::deserialize_payload(encoding, &result[0])?;
+                        Ok(Some(account))
+                    }
+                }
+            }
+            Err(_) => {
+                // Fallback: deserialize as full AccountAny (legacy format)
+                log::debug!("Deserializing account {account_id} from legacy format");
+                let account: AccountAny =
+                    Self::deserialize_payload(encoding, &result[0])?;
+                Ok(Some(account))
+            }
+            _ => Ok(None),
+        }
     }
 
-    /// Loads a single order for `trader_key` and `client_order_id` using the specified `encoding`.
+    /// Loads an order by replaying all persisted events from the Redis list.
+    ///
+    /// The order's Redis list contains serialized [`OrderEventAny`] entries
+    /// stored by [`add_order`] and [`update_order`]:
+    /// - `result[0]` is always `OrderInitialized`
+    /// - `result[1..]` are subsequent events (Submitted, Accepted, Filled, etc.)
+    ///
+    /// Reconstructs the full order state via [`OrderAny::from_events()`].
+    /// Falls back to direct deserialization for backward compatibility with
+    /// data that may have been written in a different format.
+    ///
+    /// Note: Order transforms (where a second `OrderInitialized` event appears in the
+    /// list, e.g., when a StopLimit triggers and becomes a Limit) are not handled by
+    /// `OrderAny::from_events()`, which rejects duplicate Initialized events. The
+    /// fallback path will attempt direct deserialization in this case. This is a rare
+    /// edge case that does not affect standard order flows.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying read or deserialization fails.
+    /// Returns an error if both event replay and fallback deserialization fail.
     pub async fn load_order(
         con: &ConnectionManager,
         trader_key: &str,
@@ -732,15 +760,65 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let order: OrderAny = Self::deserialize_payload(encoding, &result[0])?;
-        Ok(Some(order))
+        // Try event replay first: deserialize each list entry as an OrderEventAny
+        let events_result: anyhow::Result<Vec<OrderEventAny>> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect();
+
+        match events_result {
+            Ok(events) if !events.is_empty() => {
+                match OrderAny::from_events(events) {
+                    Ok(order) => Ok(Some(order)),
+                    Err(e) => {
+                        log::warn!(
+                            "Event replay failed for {client_order_id}, \
+                             trying direct deserialization: {e}"
+                        );
+                        let order: OrderAny =
+                            Self::deserialize_payload(encoding, &result[0])?;
+                        Ok(Some(order))
+                    }
+                }
+            }
+            Err(_) => {
+                // Fallback: deserialize as full OrderAny (legacy format)
+                log::debug!(
+                    "Deserializing order {client_order_id} from legacy format"
+                );
+                let order: OrderAny =
+                    Self::deserialize_payload(encoding, &result[0])?;
+                Ok(Some(order))
+            }
+            _ => Ok(None),
+        }
     }
 
-    /// Loads a single position for `trader_key` and `position_id` using the specified `encoding`.
+    /// Loads a single position by replaying all persisted fill events from the Redis list.
+    ///
+    /// The position's Redis list contains serialized [`OrderFilled`] entries
+    /// stored by [`add_position`] and [`update_position`]:
+    /// - `result[0]` is the initial fill that opened the position
+    /// - `result[1..]` are subsequent fills (partial closes, additions, etc.)
+    ///
+    /// Reconstruction mirrors the Cython `load_position` in `database.pyx`:
+    /// 1. Deserialize the first entry as `OrderFilled`
+    /// 2. Load the instrument from Redis using the fill's `instrument_id`
+    /// 3. Create `Position::new(&instrument, initial_fill)`
+    /// 4. Apply remaining fills via `position.apply(&fill)`
+    ///
+    /// Falls back to direct `Position` deserialization for backward
+    /// compatibility with data that may have been written in a different format.
+    ///
+    /// Note: `Position::new()` and `Position::apply()` use panicking assertions for
+    /// invariant violations (missing position_id, mismatched instrument_id, duplicate
+    /// trade_id). Corrupted fill data in Redis will cause a panic rather than a
+    /// graceful error. This is an upstream NT design choice -- the adapter trusts
+    /// that persisted fill data was validated at write time.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying read or deserialization fails.
+    /// Returns an error if both event replay and fallback deserialization fail.
     pub async fn load_position(
         con: &ConnectionManager,
         trader_key: &str,
@@ -753,8 +831,52 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let position: Position = Self::deserialize_payload(encoding, &result[0])?;
-        Ok(Some(position))
+        // Try event replay first: deserialize each list entry as an OrderFilled
+        let fills_result: anyhow::Result<Vec<OrderFilled>> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect();
+
+        match fills_result {
+            Ok(fills) if !fills.is_empty() => {
+                let initial_fill = &fills[0];
+
+                // Load the instrument needed to construct the Position
+                let instrument = Self::load_instrument(
+                    con,
+                    trader_key,
+                    &initial_fill.instrument_id,
+                    encoding,
+                )
+                .await?;
+
+                let Some(instrument) = instrument else {
+                    anyhow::bail!(
+                        "Cannot load position {position_id}: \
+                         no instrument found for {}",
+                        initial_fill.instrument_id,
+                    );
+                };
+
+                let mut position = Position::new(&instrument, fills[0]);
+
+                for fill in &fills[1..] {
+                    position.apply(fill);
+                }
+
+                Ok(Some(position))
+            }
+            Err(_) => {
+                // Fallback: deserialize as full Position (legacy format)
+                log::debug!(
+                    "Deserializing position {position_id} from legacy format"
+                );
+                let position: Position =
+                    Self::deserialize_payload(encoding, &result[0])?;
+                Ok(Some(position))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn get_collection_key(key: &str) -> anyhow::Result<&str> {
@@ -768,7 +890,7 @@ impl DatabaseQueries {
     async fn read_index(conn: &mut ConnectionManager, key: &str) -> anyhow::Result<Vec<Bytes>> {
         let index_key = get_index_key(key)?;
         match index_key {
-            INDEX_ORDER_IDS => Self::read_set(conn, key).await,
+            INDEX_ORDER_IDS => Self::read_hset(conn, key).await,
             INDEX_ORDER_POSITION => Self::read_hset(conn, key).await,
             INDEX_ORDER_CLIENT => Self::read_hset(conn, key).await,
             INDEX_ORDERS => Self::read_set(conn, key).await,

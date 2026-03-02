@@ -98,6 +98,7 @@ from nautilus_trader.core.rust.model cimport AccountType
 from nautilus_trader.core.rust.model cimport AggregationSource
 from nautilus_trader.core.rust.model cimport AggressorSide
 from nautilus_trader.core.rust.model cimport BookAction
+from nautilus_trader.core.rust.model cimport BookLevel_API
 from nautilus_trader.core.rust.model cimport BookType
 from nautilus_trader.core.rust.model cimport ContingencyType
 from nautilus_trader.core.rust.model cimport InstrumentCloseType
@@ -119,12 +120,15 @@ from nautilus_trader.core.rust.model cimport TimeInForce
 from nautilus_trader.core.rust.model cimport TriggerType
 from nautilus_trader.core.rust.model cimport level_price
 from nautilus_trader.core.rust.model cimport level_size_raw
+from nautilus_trader.core.rust.model cimport orderbook_asks_up_to
 from nautilus_trader.core.rust.model cimport orderbook_best_ask_price
 from nautilus_trader.core.rust.model cimport orderbook_best_bid_price
+from nautilus_trader.core.rust.model cimport orderbook_bids_down_to
 from nautilus_trader.core.rust.model cimport orderbook_has_ask
 from nautilus_trader.core.rust.model cimport orderbook_has_bid
 from nautilus_trader.core.rust.model cimport orderbook_ts_last
 from nautilus_trader.core.rust.model cimport trade_id_new
+from nautilus_trader.core.rust.model cimport vec_drop_book_levels
 from nautilus_trader.core.string cimport pystr_to_cstr
 from nautilus_trader.core.uuid cimport UUID4
 from nautilus_trader.data.messages cimport DataCommand
@@ -1303,16 +1307,22 @@ cdef class BacktestEngine:
         """
         Run a backtest.
 
-        At the end of the run the trader and strategies will be stopped, then
-        post-run analysis performed.
+        When ``streaming`` is False (default), the run is finalized via
+        ``end()`` which stops all engines and produces results. When True,
+        the run pauses without finalizing so additional data batches can be
+        loaded. Timer advancement stops at data exhaustion to avoid producing
+        synthetic events (e.g. zero-volume bars) past the current batch.
 
-        For datasets larger than available memory, use `streaming` mode with the
-        following sequence:
-        - 1. Add initial data batch and strategies
-        - 2. Call `run(streaming=True)`
-        - 3. Call `clear_data()`
-        - 4. Add next batch of data stream
-        - 5. Call `run(streaming=False)` or `end()` when processing the final batch
+        For datasets larger than available memory, use ``streaming`` mode::
+
+            engine.add_strategy(strategy)
+
+            for batch in data_batches:
+                engine.add_data(batch)
+                engine.run(streaming=True)
+                engine.clear_data()
+
+            engine.end()
 
         Parameters
         ----------
@@ -1325,10 +1335,10 @@ cdef class BacktestEngine:
         run_config_id : str, optional
             The tokenized `BacktestRunConfig` ID.
         streaming : bool, default False
-            Controls data loading and processing mode:
-            - If False (default): Loads all data at once.
-              This is currently the only supported mode for custom data (e.g., option Greeks).
-            - If True, loads data in chunks for memory-efficient processing of large datasets.
+            If False (default), calls ``end()`` after the run to stop
+            engines and produce results.
+            If True, pauses after data exhaustion without finalizing.
+            Call ``end()`` manually after all batches are processed.
 
         Raises
         ------
@@ -1362,6 +1372,13 @@ cdef class BacktestEngine:
         Only required if you have previously been running with streaming.
 
         """
+        # Flush remaining timer events to the backtest end boundary so that
+        # tail alerts/expiries scheduled after the last data point still fire.
+        # Must run before stopping engines since DataEngine.stop() cancels
+        # bar aggregator timers.
+        if self._end_ns > 0:
+            self._flush_accumulator_events(self._end_ns)
+
         if self._kernel.trader.is_running:
             self._kernel.trader.stop()
 
@@ -1572,6 +1589,11 @@ cdef class BacktestEngine:
         try:
             while True:
                 if data is None:
+                    if streaming:
+                        # In streaming mode, don't advance timers past the
+                        # current batch. The next batch will provide more data
+                        # and timers will fire naturally as time advances.
+                        break
                     done = self._process_next_timer()
                     data = self._data_iterator.next()
                     if data is None and done:
@@ -1651,8 +1673,13 @@ cdef class BacktestEngine:
         # Process remaining messages
         self._process_and_settle_venues(self._kernel.clock.timestamp_ns())
 
-        # Flush remaining timer events up to end time
-        self._flush_accumulator_events(end_ns)
+        # Flush remaining timer events. In streaming mode only flush to the
+        # last data timestamp to avoid advancing timers past the current batch.
+        # The final flush to end_ns happens in end() or a non-streaming run.
+        if streaming:
+            self._flush_accumulator_events(self._last_ns)
+        else:
+            self._flush_accumulator_events(end_ns)
 
     cdef CVec _advance_time(self, uint64_t ts_now):
         # Advance clocks and process all events before ts_now in timestamp order.
@@ -1783,6 +1810,7 @@ cdef class BacktestEngine:
         cdef SimulatedExchange exchange
         cdef SimulationModule module
         cdef OrderMatchingEngine matching_engine
+        cdef bint has_activity
 
         # Advance venue clocks so modules and event generators see the
         # correct timestamp even when no commands are pending
@@ -1795,18 +1823,22 @@ cdef class BacktestEngine:
         # Only process and iterate venues that had pending commands each
         # pass, to avoid extra fill-model rolls on untouched venues.
         while True:
-            active_venues = [
-                exchange for exchange in self._venues.values()
-                if exchange.has_pending_commands(ts_now)
-            ]
-            if not active_venues:
+            has_activity = False
+
+            for exchange in self._venues.values():
+                if exchange._has_pending_commands(ts_now):
+                    has_activity = True
+                    break
+
+            if not has_activity:
                 break
 
-            for exchange in active_venues:
+            # Drain all venues then iterate, keeping phases separate so
+            # cross-venue command timing is independent of iteration order
+            for exchange in self._venues.values():
                 exchange._drain_commands(ts_now)
 
-            # Iterate matching engines so newly submitted orders can match
-            for exchange in active_venues:
+            for exchange in self._venues.values():
                 for matching_engine in exchange._matching_engines.values():
                     matching_engine.iterate(ts_now)
 
@@ -1818,6 +1850,7 @@ cdef class BacktestEngine:
 
     cdef void _flush_accumulator_events(self, uint64_t ts_now):
         cdef list[TestClock] clocks = get_component_clocks(self._instance_id)
+
         cdef:
             TestClock clock
             TimeEventHandler_t handler
@@ -3232,7 +3265,7 @@ cdef class SimulatedExchange:
 
         matching_engine.update_instrument(instrument)
 
-    cpdef bint has_pending_commands(self, uint64_t ts_now):
+    cdef bint _has_pending_commands(self, uint64_t ts_now):
         if self._message_queue:
             return True
         if self._inflight_queue and self._inflight_queue[0][0][0] <= ts_now:
@@ -3892,6 +3925,10 @@ cdef class OrderMatchingEngine:
             fill_market_order=self.fill_market_order,
             fill_limit_order=self.fill_limit_order,
         )
+
+        if fill_model is not None:
+            self._core.set_fill_limit_inside_spread(fill_model.fill_limit_inside_spread())
+
         self._price_prec = instrument.price_precision
         self._size_prec = instrument.size_precision
 
@@ -3977,6 +4014,7 @@ cdef class OrderMatchingEngine:
         Condition.not_none(fill_model, "fill_model")
 
         self._fill_model = fill_model
+        self._core.set_fill_limit_inside_spread(fill_model.fill_limit_inside_spread())
 
         self._log.debug(f"Changed `FillModel` to {self._fill_model}")
 
@@ -5297,8 +5335,8 @@ cdef class OrderMatchingEngine:
     ):
         cdef Price new_price = price if price is not None else order.price
 
-        if self._core.is_limit_fillable(order.side, price):
-            if order.is_post_only and self._core.is_limit_marketable(order.side, price):
+        if self._core.is_limit_marketable(order.side, price):
+            if order.is_post_only:
                 self._generate_order_modify_rejected(
                     trader_id=order.trader_id,
                     strategy_id=order.strategy_id,
@@ -5376,8 +5414,8 @@ cdef class OrderMatchingEngine:
                 return  # Cannot update order
         else:
             # Updating limit price
-            if self._core.is_limit_fillable(order.side, price):
-                if order.is_post_only and self._core.is_limit_marketable(order.side, price):
+            if self._core.is_limit_marketable(order.side, price):
+                if order.is_post_only:
                     self._generate_order_modify_rejected(
                         trader_id=order.trader_id,
                         strategy_id=order.strategy_id,
@@ -5447,8 +5485,8 @@ cdef class OrderMatchingEngine:
                 return  # Cannot update order
         else:
             # Updating limit price
-            if self._core.is_limit_fillable(order.side, price):
-                if order.is_post_only and self._core.is_limit_marketable(order.side, price):
+            if self._core.is_limit_marketable(order.side, price):
+                if order.is_post_only:
                     self._generate_order_modify_rejected(
                         trader_id=order.trader_id,
                         strategy_id=order.strategy_id,
@@ -5936,14 +5974,18 @@ cdef class OrderMatchingEngine:
         if trade_size_raw == 0:
             return
 
+        # Skip when no resting orders in the matching engine
+        if not self._core.get_orders_bid() and not self._core.get_orders_ask():
+            return
+
         # If the book was updated after the trade's event time, depth deltas
         # already reflect this trade's consumed volume, skip to avoid double-counting
         if orderbook_ts_last(&self._book._mem) > trade_ts_event:
             return
 
         cdef:
-            list all_levels
-            list levels
+            CVec raw_levels_vec
+            BookLevel_API* raw_levels
             dict consumption
             QuantityRaw level_size
             QuantityRaw available
@@ -5952,33 +5994,30 @@ cdef class OrderMatchingEngine:
             QuantityRaw remaining
             PriceRaw level_price_raw
             tuple level_state
+            uint64_t i
 
         if aggressor_side == AggressorSide.BUYER:
-            all_levels = self._book.asks()
+            raw_levels_vec = orderbook_asks_up_to(
+                &self._book._mem, trade_price_raw, self._price_prec,
+            )
             consumption = self._ask_consumption
         elif aggressor_side == AggressorSide.SELLER:
-            all_levels = self._book.bids()
+            raw_levels_vec = orderbook_bids_down_to(
+                &self._book._mem, trade_price_raw, self._price_prec,
+            )
             consumption = self._bid_consumption
         else:
             return
 
-        cdef BookLevel level
-        levels = []
-        for level in all_levels:
-            level_price_raw = level_price(&level._mem).raw
-            if aggressor_side == AggressorSide.BUYER and level_price_raw > trade_price_raw:
-                break
-            if aggressor_side == AggressorSide.SELLER and level_price_raw < trade_price_raw:
-                break
-            levels.append(level)
+        raw_levels = <BookLevel_API*>raw_levels_vec.ptr
 
         remaining = trade_size_raw
-        for level in levels:
+        for i in range(raw_levels_vec.len):
             if remaining == 0:
                 break
-            level_size = level_size_raw(&level._mem)
+            level_size = level_size_raw(&raw_levels[i])
+            level_price_raw = level_price(&raw_levels[i]).raw
 
-            level_price_raw = level_price(&level._mem).raw
             level_state = consumption.get(level_price_raw)
             if level_state is not None:
                 # Reconcile stale level size to prevent reset in _apply_liquidity_consumption
@@ -5993,6 +6032,8 @@ cdef class OrderMatchingEngine:
             consume = min(remaining, available)
             consumption[level_price_raw] = (level_size, already_consumed + consume)
             remaining -= consume
+
+        vec_drop_book_levels(raw_levels_vec)
 
     cdef list[tuple[Price, Quantity]] _apply_liquidity_consumption(
         self,
@@ -6620,7 +6661,7 @@ cdef class OrderMatchingEngine:
             ClientOrderId client_order_id
             PriceRaw order_price_raw
             Order order
-        for client_order_id in list(self._queue_ahead.keys()):
+        for client_order_id in list(self._queue_ahead):
             order_price_raw, _ = self._queue_ahead[client_order_id]
             if order_price_raw == deleted_price_raw:
                 order = self._core.get_order(client_order_id)
@@ -6631,7 +6672,7 @@ cdef class OrderMatchingEngine:
         cdef:
             ClientOrderId client_order_id
             PriceRaw order_price_raw
-        for client_order_id in list(self._queue_ahead.keys()):
+        for client_order_id in list(self._queue_ahead):
             order_price_raw, _ = self._queue_ahead[client_order_id]
             self._queue_ahead[client_order_id] = (order_price_raw, 0)
 
@@ -6644,7 +6685,7 @@ cdef class OrderMatchingEngine:
             QuantityRaw ahead_raw
             QuantityRaw new_ahead
             Order order
-        for client_order_id in list(self._queue_ahead.keys()):
+        for client_order_id in list(self._queue_ahead):
             order_price_raw, ahead_raw = self._queue_ahead[client_order_id]
 
             order = self._core.get_order(client_order_id)
@@ -6700,7 +6741,7 @@ cdef class OrderMatchingEngine:
             QuantityRaw ahead_raw
             bint crossed
             Order order
-        for client_order_id in list(self._queue_ahead.keys()):
+        for client_order_id in list(self._queue_ahead):
             order_price_raw, ahead_raw = self._queue_ahead[client_order_id]
 
             order = self._core.get_order(client_order_id)
@@ -6724,7 +6765,7 @@ cdef class OrderMatchingEngine:
                 self._queue_ahead[client_order_id] = (order_price_raw, new_size_raw)
 
         # Also resolve pending L1 orders affected by this price move
-        for client_order_id in list(self._queue_pending.keys()):
+        for client_order_id in list(self._queue_pending):
             order_price_raw = self._queue_pending[client_order_id]
 
             order = self._core.get_order(client_order_id)
@@ -6752,7 +6793,7 @@ cdef class OrderMatchingEngine:
             ClientOrderId client_order_id
             PriceRaw order_price_raw
             Order order
-        for client_order_id in list(self._queue_pending.keys()):
+        for client_order_id in list(self._queue_pending):
             order_price_raw = self._queue_pending[client_order_id]
 
             order = self._core.get_order(client_order_id)
@@ -6774,7 +6815,7 @@ cdef class OrderMatchingEngine:
             PriceRaw order_price_raw
             bint crossed
             Order order
-        for client_order_id in list(self._queue_pending.keys()):
+        for client_order_id in list(self._queue_pending):
             order_price_raw = self._queue_pending[client_order_id]
 
             order = self._core.get_order(client_order_id)
@@ -7760,7 +7801,7 @@ cdef class OrderMatchingEngine:
             )
             return
 
-        if self._core.is_limit_fillable(order.side, price):
+        if self._core.is_limit_marketable(order.side, price):
             order.liquidity_side = LiquiditySide.TAKER
             self.fill_limit_order(order)
 

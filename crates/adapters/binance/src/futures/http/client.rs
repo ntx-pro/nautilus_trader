@@ -368,6 +368,7 @@ impl BinanceRawFuturesHttpClient {
             .unwrap_or_default();
 
         let mut headers = HashMap::new();
+
         if signed {
             let cred = self
                 .credential
@@ -425,6 +426,7 @@ impl BinanceRawFuturesHttpClient {
         };
 
         let mut url = format!("{}{}", self.base_url, url_path);
+
         if !query.is_empty() {
             url.push('?');
             url.push_str(query);
@@ -460,6 +462,7 @@ impl BinanceRawFuturesHttpClient {
     fn default_headers(credential: &Option<Credential>) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         headers.insert("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string());
+
         if let Some(cred) = credential {
             headers.insert("X-MBX-APIKEY".to_string(), cred.api_key().to_string());
         }
@@ -1525,6 +1528,7 @@ impl BinanceFuturesHttpClient {
                 | OrderType::MarketIfTouched
                 | OrderType::LimitIfTouched
         );
+
         if requires_trigger_price && trigger_price.is_none() {
             anyhow::bail!("Order type {order_type:?} requires a trigger price");
         }
@@ -1785,7 +1789,7 @@ impl BinanceFuturesHttpClient {
         };
 
         let response = self.raw.cancel_algo_order(&params).await?;
-        if response.code == 200 {
+        if response.code.parse::<i32>().unwrap_or(0) == 200 {
             Ok(())
         } else {
             anyhow::bail!(
@@ -1813,7 +1817,7 @@ impl BinanceFuturesHttpClient {
         };
 
         let response = self.raw.cancel_all_orders(&params).await?;
-        if response.code == 200 {
+        if response.code.parse::<i32>().unwrap_or(0) == 200 {
             Ok(vec![])
         } else {
             anyhow::bail!("Cancel all orders failed: {}", response.msg);
@@ -1834,7 +1838,7 @@ impl BinanceFuturesHttpClient {
         };
 
         let response = self.raw.cancel_all_algo_orders(&params).await?;
-        if response.code == 200 {
+        if response.code.parse::<i32>().unwrap_or(0) == 200 {
             Ok(())
         } else {
             anyhow::bail!("Cancel all algo orders failed: {}", response.msg);

@@ -205,6 +205,14 @@ repos:
         files: '\.rs$'
         pass_filenames: false
 
+      - id: check-if-spacing
+        name: check if spacing
+        description: Enforces blank line above if statements
+        entry: bash .pre-commit-hooks/check_if_spacing.sh
+        language: system
+        files: '\.rs$'
+        pass_filenames: false
+
       - id: check-docs-conventions
         name: check docs conventions
         description: Enforces Rust documentation conventions
@@ -281,7 +289,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.2
+    rev: v0.15.4
     hooks:
       - id: ruff
         name: ruff
@@ -290,7 +298,7 @@ repos:
         name: ruff-format
 
   - repo: https://github.com/pycqa/isort
-    rev: 8.0.0
+    rev: 8.0.1
     hooks:
       - id: isort
         name: isort (cython)
@@ -334,7 +342,7 @@ repos:
         ]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.10.6 # Must match uv-version file
+    rev: 0.10.7 # Must match uv-version file
     hooks:
       - id: uv-lock
         files: ^python/uv\.lock$

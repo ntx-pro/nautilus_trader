@@ -815,12 +815,16 @@ impl PyStrategy {
     #[inline]
     #[allow(unsafe_code)]
     pub(crate) fn inner(&self) -> &PyStrategyInner {
+        // SAFETY: `PyStrategy` is `unsendable` so access is single-threaded, and
+        // callers never hold a mutable and shared reference simultaneously.
         unsafe { &*self.inner.get() }
     }
 
     #[inline]
     #[allow(unsafe_code, clippy::mut_from_ref)]
     pub(crate) fn inner_mut(&self) -> &mut PyStrategyInner {
+        // SAFETY: `PyStrategy` is `unsendable` so access is single-threaded, and
+        // callers never hold a mutable and shared reference simultaneously.
         unsafe { &mut *self.inner.get() }
     }
 }
@@ -851,8 +855,6 @@ impl PyStrategy {
     }
 
     /// Updates the strategy_id (actor_id) in both the core config and the actor_id field.
-    ///
-    /// # Safety
     ///
     /// Must only be called before registration. See `PyDataActor::set_actor_id`.
     pub fn set_strategy_id(&mut self, strategy_id: StrategyId) {

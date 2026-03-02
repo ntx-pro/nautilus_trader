@@ -2126,8 +2126,6 @@ uint64_t orderbook_delta_hash(const struct OrderBookDelta_t *delta);
 /**
  * Creates a new [`OrderBookDeltas_API`] instance from a `CVec` of `OrderBookDelta`.
  *
- * # Safety
- *
  * - The `deltas` must be a valid pointer to a `CVec` containing `OrderBookDelta` objects.
  * - This function clones the data pointed to by `deltas` into Rust-managed memory, then forgets the original `Vec` to prevent Rust from auto-deallocating it.
  * - The caller is responsible for managing the memory of `deltas` (including its deallocation) to avoid memory leaks.
@@ -3120,6 +3118,10 @@ void orderbook_apply_depth(struct OrderBook_API *book, const struct OrderBookDep
 CVec orderbook_bids(struct OrderBook_API *book);
 
 CVec orderbook_asks(struct OrderBook_API *book);
+
+CVec orderbook_bids_down_to(struct OrderBook_API *book, PriceRaw price_raw, uint8_t price_prec);
+
+CVec orderbook_asks_up_to(struct OrderBook_API *book, PriceRaw price_raw, uint8_t price_prec);
 
 uint8_t orderbook_has_bid(struct OrderBook_API *book);
 

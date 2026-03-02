@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
@@ -24,7 +23,6 @@ from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.adapters.hyperliquid.config import HyperliquidExecClientConfig
-from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_BUILDER_FEE_NOT_APPROVED
 from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_POST_ONLY_WOULD_MATCH
 from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_VENUE
 from nautilus_trader.adapters.hyperliquid.providers import HyperliquidInstrumentProvider
@@ -54,6 +52,7 @@ from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import order_side_to_str
 from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.events import OrderAccepted
@@ -149,8 +148,6 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         self._terminal_orders: nautilus_pyo3.FifoCache = nautilus_pyo3.FifoCache()
         self._pending_filled: set[str] = set()
 
-        self._fee_refresh_task: asyncio.Task | None = None
-
         # Get user address from HTTP client for WebSocket subscriptions
         # Use vault address when vault trading, otherwise order/fill
         # updates for the vault will be missed
@@ -198,14 +195,11 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         await self._update_account_state()
         await self._await_account_registered()
 
-        # Fetch initial builder fee tier from HL
-        await self._fetch_and_update_builder_fee(log_always=True)
-
         self._sync_cloid_cache()
 
         instruments = self._instrument_provider.instruments_pyo3()
 
-        await self._ws_client.connect(instruments, self._handle_msg)
+        await self._ws_client.connect(self._loop, instruments, self._handle_msg)
         self._log.info(f"Connected to WebSocket {self._ws_client.url}", LogColor.BLUE)
 
         if self._user_address:
@@ -218,21 +212,6 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             await self._ws_client.subscribe_user_events(self._user_address)
             self._log.info(
                 f"Subscribed to user events (includes fills) for {self._user_address}",
-                LogColor.BLUE,
-            )
-
-        # Start periodic builder fee refresh after successful connect
-        if self._fee_refresh_task is not None:
-            self._fee_refresh_task.cancel()
-            self._fee_refresh_task = None
-
-        refresh_mins = self._config.builder_fee_refresh_mins
-        if refresh_mins is not None:
-            self._fee_refresh_task = self.create_task(
-                self._builder_fee_refresh_loop(refresh_mins * 60),
-            )
-            self._log.info(
-                f"Builder fee refresh scheduled every {refresh_mins}m",
                 LogColor.BLUE,
             )
 
@@ -278,79 +257,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 f"Generated account state with {len(account_state.balances)} balance(s)",
             )
 
-    @staticmethod
-    def _fmt_bp(bp: Decimal) -> str:
-        return f"{bp:.1f} bp ({(bp / 100).normalize()}%)"
-
-    def _log_fee_summary(
-        self,
-        maker_rate: str,
-        taker_rate: str,
-        builder_maker_tenths_bp: int,
-        builder_taker_tenths_bp: int,
-    ) -> None:
-        maker_d = Decimal(maker_rate)
-        taker_d = Decimal(taker_rate)
-        hl_maker_bp = maker_d * 10_000
-        hl_taker_bp = taker_d * 10_000
-        builder_maker_bp = Decimal(builder_maker_tenths_bp) / 10
-        builder_taker_bp = Decimal(builder_taker_tenths_bp) / 10
-        self._log.info(
-            f"HL maker: {self._fmt_bp(hl_maker_bp)}, "
-            f"builder maker: {self._fmt_bp(builder_maker_bp)}, "
-            f"total maker: {self._fmt_bp(hl_maker_bp + builder_maker_bp)}",
-            LogColor.BLUE,
-        )
-        self._log.info(
-            f"HL taker: {self._fmt_bp(hl_taker_bp)}, "
-            f"builder taker: {self._fmt_bp(builder_taker_bp)}, "
-            f"total taker: {self._fmt_bp(hl_taker_bp + builder_taker_bp)}",
-            LogColor.BLUE,
-        )
-
-    async def _fetch_and_update_builder_fee(self, log_always: bool = False) -> None:
-        try:
-            json_str = await self._client.info_user_fees()
-            data = json.loads(json_str)
-            raw_add_rate = data.get("userAddRate")
-            if raw_add_rate is None:
-                raise ValueError("missing userAddRate in response")
-            raw_cross_rate = data.get("userCrossRate")
-            if raw_cross_rate is None:
-                raise ValueError("missing userCrossRate in response")
-
-            user_add_rate = float(raw_add_rate)
-            user_cross_rate = float(raw_cross_rate)
-            (maker_old, maker_new), (taker_old, taker_new) = self._client.update_builder_fees(
-                user_add_rate,
-                user_cross_rate,
-            )
-
-            if log_always or maker_old != maker_new or taker_old != taker_new:
-                self._log_fee_summary(raw_add_rate, raw_cross_rate, maker_new, taker_new)
-        except Exception as e:
-            maker_bp = Decimal(self._client.builder_maker_tenths_bp()) / 10
-            taker_bp = Decimal(self._client.builder_taker_tenths_bp()) / 10
-            self._log.warning(
-                f"Failed to query userFees, retaining builder fees: "
-                f"maker {self._fmt_bp(maker_bp)}, taker {self._fmt_bp(taker_bp)}: {e}",
-            )
-
-    async def _builder_fee_refresh_loop(self, interval_secs: int) -> None:
-        try:
-            while True:
-                await asyncio.sleep(interval_secs)
-                await self._fetch_and_update_builder_fee()
-        except asyncio.CancelledError:
-            self._log.debug("Canceled task 'builder_fee_refresh'")
-            return
-
     async def _disconnect(self) -> None:
-        if self._fee_refresh_task is not None:
-            self._log.debug("Canceling task 'builder_fee_refresh'")
-            self._fee_refresh_task.cancel()
-            self._fee_refresh_task = None
-
         # Delay to allow websocket to send any unsubscribe messages
         await asyncio.sleep(1.0)
 
@@ -633,11 +540,47 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
         return nautilus_pyo3.Price.from_decimal(price)
 
+    def _derive_limit_from_trigger(self, order, trigger_price) -> Decimal:
+        slippage_pct = Decimal("0.005")
+        base_price = Decimal(str(trigger_price))
+
+        if order.side == OrderSide.BUY:
+            price = base_price * (Decimal(1) + slippage_pct)
+        else:
+            price = base_price * (Decimal(1) - slippage_pct)
+
+        price = self._round_to_significant_figures(price, sig_figs=5)
+
+        instrument = self._cache.instrument(order.instrument_id)
+        if instrument is not None:
+            quantizer = Decimal(10) ** -instrument.price_precision
+            if order.side == OrderSide.BUY:
+                price = price.quantize(quantizer, rounding=ROUND_CEILING)
+            else:
+                price = price.quantize(quantizer, rounding=ROUND_FLOOR)
+
+        return price.normalize()
+
+    def _check_time_in_force(self, order) -> bool:
+        if order.time_in_force not in (TimeInForce.GTC, TimeInForce.IOC):
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=f"UNSUPPORTED_TIME_IN_FORCE: {TimeInForce(order.time_in_force).name} not supported by Hyperliquid",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return False
+        return True
+
     async def _submit_order(self, command: SubmitOrder) -> None:
         order = command.order
 
         if order.is_closed:
             self._log.warning(f"Order {order} is already closed")
+            return
+
+        if not self._check_time_in_force(order):
             return
 
         self.generate_order_submitted(
@@ -700,12 +643,6 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             error_str = str(e)
             due_post_only = HYPERLIQUID_POST_ONLY_WOULD_MATCH in error_str
 
-            if HYPERLIQUID_BUILDER_FEE_NOT_APPROVED in error_str:
-                self._log.warning(
-                    "Builder fee not approved. See: "
-                    "https://nautilustrader.io/docs/nightly/integrations/hyperliquid#builder-fee-approval",
-                )
-
             self._terminal_orders.add(order.client_order_id.value)
 
             # Only clean up cloid on confirmed rejections, not transport
@@ -736,6 +673,10 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             self._log.warning(f"Skipping {len(closed_orders)} closed orders in batch")
             orders = [order for order in orders if not order.is_closed]
 
+        if not orders:
+            return
+
+        orders = [o for o in orders if self._check_time_in_force(o)]
         if not orders:
             return
 
@@ -778,10 +719,100 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 )
 
     async def _modify_order(self, command: ModifyOrder) -> None:
-        # The modify functionality exists in Rust but requires exposing post_action() to Python
-        self._log.warning(
-            f"Order modification requires venue_order_id and is not yet exposed via Python bindings for {command.client_order_id}",
-        )
+        order = self._cache.order(command.client_order_id)
+
+        if order is None:
+            self.generate_order_modify_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=command.venue_order_id,
+                reason="ORDER_NOT_FOUND_IN_CACHE",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        venue_order_id = None
+        if order.venue_order_id:
+            venue_order_id = order.venue_order_id
+        elif command.venue_order_id:
+            venue_order_id = command.venue_order_id
+
+        if venue_order_id is None:
+            self.generate_order_modify_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=venue_order_id,
+                reason="VENUE_ORDER_ID_REQUIRED",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        # Use command values if provided, else fall back to current order values
+        price = command.price if command.price else (order.price if order.has_price else None)
+        quantity = command.quantity if command.quantity else order.leaves_qty
+        trigger_price = command.trigger_price
+        if not trigger_price and order.has_trigger_price:
+            trigger_price = order.trigger_price
+
+        # StopMarket/MarketIfTouched have no limit price — derive a
+        # slippage-adjusted limit from the trigger, matching submit path
+        if price is None and trigger_price is not None:
+            price = self._derive_limit_from_trigger(order, trigger_price)
+
+        if price is None:
+            self.generate_order_modify_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=venue_order_id,
+                reason="PRICE_REQUIRED_FOR_MODIFY",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        try:
+            pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
+                command.instrument_id.value,
+            )
+            pyo3_venue_order_id = nautilus_pyo3.VenueOrderId(venue_order_id.value)
+            pyo3_order_side = nautilus_pyo3.OrderSide.from_str(order.side.name)
+            pyo3_order_type = order_type_to_pyo3(order.order_type)
+            pyo3_price = nautilus_pyo3.Price.from_str(str(price))
+            pyo3_quantity = nautilus_pyo3.Quantity.from_str(str(quantity))
+            pyo3_time_in_force = time_in_force_to_pyo3(order.time_in_force)
+            pyo3_client_order_id = nautilus_pyo3.ClientOrderId(
+                command.client_order_id.value,
+            )
+
+            pyo3_trigger_price = None
+            if trigger_price is not None:
+                pyo3_trigger_price = nautilus_pyo3.Price.from_str(str(trigger_price))
+
+            await self._client.modify_order(
+                instrument_id=pyo3_instrument_id,
+                venue_order_id=pyo3_venue_order_id,
+                order_side=pyo3_order_side,
+                order_type=pyo3_order_type,
+                price=pyo3_price,
+                quantity=pyo3_quantity,
+                trigger_price=pyo3_trigger_price,
+                reduce_only=order.is_reduce_only,
+                post_only=order.is_post_only,
+                time_in_force=pyo3_time_in_force,
+                client_order_id=pyo3_client_order_id,
+            )
+            self._log.info(f"Order modification requested for {command.client_order_id}")
+        except Exception as e:
+            self.generate_order_modify_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=venue_order_id,
+                reason=str(e),
+                ts_event=self._clock.timestamp_ns(),
+            )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         # Try to get venue_order_id from cache first, fall back to command

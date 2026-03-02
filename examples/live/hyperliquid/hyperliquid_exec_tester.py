@@ -41,9 +41,6 @@ from nautilus_trader.test_kit.strategies.tester_exec import ExecTesterConfig
 # Environment variables required:
 # Mainnet: HYPERLIQUID_PK (and optionally HYPERLIQUID_VAULT)
 # Testnet: HYPERLIQUID_TESTNET_PK (and optionally HYPERLIQUID_TESTNET_VAULT)
-#
-# Before trading, approve builder fees (one-time per wallet per network):
-#   python nautilus_trader/adapters/hyperliquid/scripts/builder_fee_approve.py
 
 
 class HyperliquidProductType(Enum):
@@ -147,6 +144,8 @@ strat_config = ExecTesterConfig(
     # enable_stop_sells=True,
     # tob_offset_ticks=0,  # Ticks away from top of book (0 = at market)
     use_post_only=True,  # Use post-only orders to get maker fees
+    # modify_orders_to_maintain_tob_offset=True,
+    # use_individual_cancels_on_stop=True,
     reduce_only_on_stop=reduce_only_on_stop,
     # cancel_orders_on_stop=False,
     # close_positions_on_stop=False,

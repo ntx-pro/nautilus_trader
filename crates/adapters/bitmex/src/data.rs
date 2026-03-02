@@ -35,10 +35,11 @@ use nautilus_common::{
             BarsResponse, DataResponse, InstrumentResponse, InstrumentsResponse, RequestBars,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
             SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
-            SubscribeInstrument, SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes,
-            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-            UnsubscribeBookDepth10, UnsubscribeFundingRates, UnsubscribeIndexPrices,
-            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeInstrument, SubscribeInstrumentStatus, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeInstrumentStatus, UnsubscribeMarkPrices,
+            UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -215,6 +216,11 @@ impl BitmexDataClient {
                     }
                 }
             }
+            NautilusWsMessage::InstrumentStatus(status) => {
+                if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
+                    log::error!("Failed to send instrument status event: {e}");
+                }
+            }
             NautilusWsMessage::FundingRateUpdates(updates) => {
                 for update in updates {
                     log::debug!(
@@ -222,6 +228,7 @@ impl BitmexDataClient {
                         update.instrument_id,
                         update.rate,
                     );
+
                     if let Err(e) = sender.send(DataEvent::FundingRate(update)) {
                         log::error!("Failed to emit funding rate event: {e}");
                     }
@@ -266,6 +273,7 @@ impl BitmexDataClient {
 
         for instrument in &instruments {
             self.http_client.cache_instrument(instrument.clone());
+
             if let Err(e) = self
                 .data_sender
                 .send(DataEvent::Instrument(instrument.clone()))
@@ -420,6 +428,7 @@ impl DataClient for BitmexDataClient {
         }
 
         let instruments = self.bootstrap_instruments().await?;
+
         if let Some(ws) = self.ws_client.as_mut() {
             ws.cache_instruments(instruments);
         }
@@ -682,6 +691,42 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
+    fn subscribe_instrument_status(
+        &mut self,
+        cmd: &SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let ws = self.ws_client()?.clone();
+
+        self.spawn_ws(
+            async move {
+                ws.subscribe_instrument(instrument_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))
+            },
+            "BitMEX instrument status subscription",
+        );
+        Ok(())
+    }
+
+    fn unsubscribe_instrument_status(
+        &mut self,
+        cmd: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let ws = self.ws_client()?.clone();
+
+        self.spawn_ws(
+            async move {
+                ws.unsubscribe_instrument(instrument_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))
+            },
+            "BitMEX instrument status unsubscribe",
+        );
+        Ok(())
+    }
+
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
@@ -877,6 +922,7 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send instruments response: {e}");
                     }
@@ -906,6 +952,7 @@ impl DataClient for BitmexDataClient {
                 self.clock.get_time_ns(),
                 request.params,
             )));
+
             if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
                 log::error!("Failed to send instrument response: {e}");
             }
@@ -948,6 +995,7 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     )));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send instrument response: {e}");
                     }
@@ -991,6 +1039,7 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send trades response: {e}");
                     }
@@ -1033,6 +1082,7 @@ impl DataClient for BitmexDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send bars response: {e}");
                     }

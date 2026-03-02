@@ -17,13 +17,17 @@
 
 use std::{
     future::Future,
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use dashmap::DashSet;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
@@ -43,7 +47,7 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType, OrderType},
+    enums::{AccountType, OmsType, OrderStatus, OrderType, TrailingOffsetType},
     events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
@@ -52,12 +56,13 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
 };
+use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
 use crate::{
     common::{
         consts::{OKX_CONDITIONAL_ORDER_TYPES, OKX_VENUE},
-        enums::{OKXInstrumentType, OKXMarginMode, OKXTradeMode},
+        enums::{OKXInstrumentType, OKXMarginMode, OKXTradeMode, is_advance_algo_order},
     },
     config::OKXExecClientConfig,
     http::{client::OKXHttpClient, models::OKXCancelAlgoOrderRequest},
@@ -66,6 +71,53 @@ use crate::{
         messages::{ExecutionReport, NautilusWsMessage},
     },
 };
+
+/// Maximum entries in the dedup sets before they are cleared.
+const DEDUP_CAPACITY: usize = 10_000;
+
+/// Shared state for cross-stream event deduplication between the private
+/// and business WebSocket dispatch loops.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct WsDispatchState {
+    pub filled_orders: DashSet<ClientOrderId>,
+    pub triggered_orders: DashSet<ClientOrderId>,
+    clearing: AtomicBool,
+}
+
+impl Default for WsDispatchState {
+    fn default() -> Self {
+        Self {
+            filled_orders: DashSet::default(),
+            triggered_orders: DashSet::default(),
+            clearing: AtomicBool::new(false),
+        }
+    }
+}
+
+impl WsDispatchState {
+    fn evict_if_full(&self, set: &DashSet<ClientOrderId>) {
+        if set.len() >= DEDUP_CAPACITY
+            && self
+                .clearing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            set.clear();
+            self.clearing.store(false, Ordering::Release);
+        }
+    }
+
+    fn insert_filled(&self, cid: ClientOrderId) {
+        self.evict_if_full(&self.filled_orders);
+        self.filled_orders.insert(cid);
+    }
+
+    fn insert_triggered(&self, cid: ClientOrderId) {
+        self.evict_if_full(&self.triggered_orders);
+        self.triggered_orders.insert(cid);
+    }
+}
 
 #[derive(Debug)]
 pub struct OKXExecutionClient {
@@ -79,6 +131,7 @@ pub struct OKXExecutionClient {
     trade_mode: OKXTradeMode,
     ws_stream_handle: Option<JoinHandle<()>>,
     ws_business_stream_handle: Option<JoinHandle<()>>,
+    ws_dispatch_state: Arc<WsDispatchState>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -146,6 +199,7 @@ impl OKXExecutionClient {
             trade_mode,
             ws_stream_handle: None,
             ws_business_stream_handle: None,
+            ws_dispatch_state: Arc::new(WsDispatchState::default()),
             pending_tasks: Mutex::new(Vec::new()),
         })
     }
@@ -275,9 +329,6 @@ impl OKXExecutionClient {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?
         };
-        let trigger_price = order
-            .trigger_price()
-            .ok_or_else(|| anyhow::anyhow!("conditional order requires a trigger price"))?;
         let http_client = self.http_client.clone();
         let trade_mode = self.trade_mode;
 
@@ -290,8 +341,34 @@ impl OKXExecutionClient {
         let order_type = order.order_type();
         let quantity = order.quantity();
         let trigger_type = order.trigger_type();
+        let trigger_price = order.trigger_price();
         let price = order.price();
         let is_reduce_only = order.is_reduce_only();
+
+        let trailing_offset = order.trailing_offset();
+        let trailing_offset_type = order.trailing_offset_type();
+        let activation_price = order.activation_price();
+
+        let (callback_ratio, callback_spread) = if order_type == OrderType::TrailingStopMarket {
+            let offset = trailing_offset
+                .ok_or_else(|| anyhow::anyhow!("TrailingStopMarket requires trailing_offset"))?;
+            let offset_type = trailing_offset_type.ok_or_else(|| {
+                anyhow::anyhow!("TrailingStopMarket requires trailing_offset_type")
+            })?;
+            match offset_type {
+                TrailingOffsetType::BasisPoints => {
+                    // Convert basis points to ratio (e.g., 100 bps = 0.01)
+                    let ratio = offset / Decimal::from(10000);
+                    (Some(ratio.to_string()), None)
+                }
+                TrailingOffsetType::Price => (None, Some(offset.to_string())),
+                _ => {
+                    anyhow::bail!("Unsupported trailing_offset_type for OKX: {offset_type:?}");
+                }
+            }
+        } else {
+            (None, None)
+        };
 
         self.spawn_task("submit_algo_order", async move {
             let result = http_client
@@ -306,6 +383,9 @@ impl OKXExecutionClient {
                     trigger_type,
                     price,
                     Some(is_reduce_only),
+                    callback_ratio,
+                    callback_spread,
+                    activation_price,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("Submit algo order failed: {e}"));
@@ -359,6 +439,80 @@ impl OKXExecutionClient {
                     ts_event,
                 );
                 return Err(e);
+            }
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+
+    fn cancel_algo_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+        let http_client = self.http_client.clone();
+        let command = cmd.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+
+        let cache = self.core.cache();
+        let is_advance = cache
+            .order(&cmd.client_order_id)
+            .is_some_and(|o| is_advance_algo_order(o.order_type()));
+        drop(cache);
+
+        let request = OKXCancelAlgoOrderRequest {
+            inst_id: cmd.instrument_id.symbol.to_string(),
+            inst_id_code: None,
+            algo_id: cmd.venue_order_id.map(|id| id.to_string()),
+            algo_cl_ord_id: if cmd.venue_order_id.is_none() {
+                Some(cmd.client_order_id.to_string())
+            } else {
+                None
+            },
+        };
+
+        self.spawn_task("cancel_algo_order", async move {
+            let responses = if is_advance {
+                http_client
+                    .cancel_advance_algo_orders(vec![request])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Cancel advance algo order failed: {e}"))
+            } else {
+                http_client
+                    .cancel_algo_orders(vec![request])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Cancel algo order failed: {e}"))
+            };
+
+            let reject_reason = match &responses {
+                Err(e) => Some(format!("cancel-algo-order-error: {e}")),
+                Ok(resps) => {
+                    // Check per-order business status code
+                    resps.first().and_then(|r| {
+                        r.s_code.as_deref().and_then(|code| {
+                            if code == "0" {
+                                None
+                            } else {
+                                let msg = r.s_msg.as_deref().unwrap_or("unknown");
+                                Some(format!(
+                                    "cancel-algo-order-rejected: s_code={code}, s_msg={msg}"
+                                ))
+                            }
+                        })
+                    })
+                }
+            };
+
+            if let Some(reason) = reject_reason {
+                let ts_event = clock.get_time_ns();
+                emitter.emit_order_cancel_rejected_event(
+                    command.strategy_id,
+                    command.instrument_id,
+                    command.client_order_id,
+                    command.venue_order_id,
+                    &reason,
+                    ts_event,
+                );
+                anyhow::bail!("{reason}");
             }
 
             Ok(())
@@ -490,10 +644,18 @@ impl ExecutionClient for OKXExecutionClient {
                 all_inst_id_codes.extend(inst_id_codes);
             }
 
-            if !all_instruments.is_empty() {
-                self.ws_private.cache_instruments(all_instruments);
-                self.ws_private.cache_inst_id_codes(all_inst_id_codes);
+            if all_instruments.is_empty() {
+                anyhow::bail!(
+                    "No instruments loaded for configured types {instrument_types:?}, \
+                     cannot initialize execution client"
+                );
             }
+
+            self.ws_private.cache_instruments(all_instruments.clone());
+            self.ws_private
+                .cache_inst_id_codes(all_inst_id_codes.clone());
+            self.ws_business.cache_instruments(all_instruments);
+            self.ws_business.cache_inst_id_codes(all_inst_id_codes);
             self.core.set_instruments_initialized();
         }
 
@@ -504,10 +666,11 @@ impl ExecutionClient for OKXExecutionClient {
         if self.ws_stream_handle.is_none() {
             let stream = self.ws_private.stream();
             let emitter = self.emitter.clone();
+            let state = Arc::clone(&self.ws_dispatch_state);
             let handle = get_runtime().spawn(async move {
                 pin_mut!(stream);
                 while let Some(message) = stream.next().await {
-                    dispatch_ws_message(message, &emitter);
+                    dispatch_ws_message(message, &emitter, &state);
                 }
             });
             self.ws_stream_handle = Some(handle);
@@ -520,10 +683,11 @@ impl ExecutionClient for OKXExecutionClient {
         if self.ws_business_stream_handle.is_none() {
             let stream = self.ws_business.stream();
             let emitter = self.emitter.clone();
+            let state = Arc::clone(&self.ws_dispatch_state);
             let handle = get_runtime().spawn(async move {
                 pin_mut!(stream);
                 while let Some(message) = stream.next().await {
-                    dispatch_ws_message(message, &emitter);
+                    dispatch_ws_message(message, &emitter, &state);
                 }
             });
             self.ws_business_stream_handle = Some(handle);
@@ -547,6 +711,7 @@ impl ExecutionClient for OKXExecutionClient {
         for inst_type in &instrument_types {
             if *inst_type != OKXInstrumentType::Option {
                 self.ws_business.subscribe_orders_algo(*inst_type).await?;
+                self.ws_business.subscribe_algo_advance(*inst_type).await?;
             }
         }
 
@@ -637,6 +802,7 @@ impl ExecutionClient for OKXExecutionClient {
         // Spawn instrument bootstrap task
         let http_client = self.http_client.clone();
         let ws_private = self.ws_private.clone();
+        let ws_business = self.ws_business.clone();
         let instrument_types = self.config.instrument_types.clone();
 
         get_runtime().spawn(async move {
@@ -665,8 +831,10 @@ impl ExecutionClient for OKXExecutionClient {
                     "Instrument bootstrap yielded no instruments; WebSocket submissions may fail"
                 );
             } else {
-                ws_private.cache_instruments(all_instruments);
-                ws_private.cache_inst_id_codes(all_inst_id_codes);
+                ws_private.cache_instruments(all_instruments.clone());
+                ws_private.cache_inst_id_codes(all_inst_id_codes.clone());
+                ws_business.cache_instruments(all_instruments);
+                ws_business.cache_inst_id_codes(all_inst_id_codes);
                 log::info!("Instruments initialized");
             }
         });
@@ -693,7 +861,12 @@ impl ExecutionClient for OKXExecutionClient {
 
         self.core.set_stopped();
         self.core.set_disconnected();
+
         if let Some(handle) = self.ws_stream_handle.take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self.ws_business_stream_handle.take() {
             handle.abort();
         }
         self.abort_pending_tasks();
@@ -727,11 +900,10 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
-        log::warn!(
-            "submit_order_list not yet implemented for OKX execution client (got {} orders)",
+        anyhow::bail!(
+            "submit_order_list not implemented for OKX execution client (got {} orders)",
             cmd.order_list.client_order_ids.len()
         );
-        Ok(())
     }
 
     fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
@@ -775,7 +947,17 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
-        self.cancel_ws_order(cmd)
+        let cache = self.core.cache();
+        let is_pending_algo = cache.order(&cmd.client_order_id).is_some_and(|o| {
+            self.is_conditional_order(o.order_type()) && o.is_triggered() != Some(true)
+        });
+        drop(cache);
+
+        if is_pending_algo {
+            self.cancel_algo_order(cmd)
+        } else {
+            self.cancel_ws_order(cmd)
+        }
     }
 
     fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
@@ -842,34 +1024,52 @@ impl ExecutionClient for OKXExecutionClient {
             // OKX doesn't support algo cancel via private WebSocket, must use HTTP
             if !algo_orders.is_empty() {
                 let http_client = self.http_client.clone();
-                let requests: Vec<OKXCancelAlgoOrderRequest> = algo_orders
-                    .into_iter()
-                    .map(
-                        |(
-                            instrument_id,
-                            client_order_id,
-                            venue_order_id,
-                            _trader_id,
-                            _strategy_id,
-                        )| {
-                            OKXCancelAlgoOrderRequest {
-                                inst_id: instrument_id.symbol.to_string(),
-                                inst_id_code: None,
-                                algo_id: venue_order_id.map(|id| id.to_string()),
-                                algo_cl_ord_id: if venue_order_id.is_none() {
-                                    Some(client_order_id.to_string())
-                                } else {
-                                    None
-                                },
-                            }
-                        },
-                    )
-                    .collect();
+                let mut regular_algo_requests = Vec::new();
+                let mut advance_algo_requests = Vec::new();
 
-                self.spawn_task("cancel_algo_orders", async move {
-                    http_client.cancel_algo_orders(requests).await?;
-                    Ok(())
-                });
+                for (instrument_id, client_order_id, venue_order_id, _trader_id, _strategy_id) in
+                    algo_orders
+                {
+                    let request = OKXCancelAlgoOrderRequest {
+                        inst_id: instrument_id.symbol.to_string(),
+                        inst_id_code: None,
+                        algo_id: venue_order_id.map(|id| id.to_string()),
+                        algo_cl_ord_id: if venue_order_id.is_none() {
+                            Some(client_order_id.to_string())
+                        } else {
+                            None
+                        },
+                    };
+
+                    let cache = self.core.cache();
+                    let is_advance = cache
+                        .order(&client_order_id)
+                        .is_some_and(|o| is_advance_algo_order(o.order_type()));
+                    drop(cache);
+
+                    if is_advance {
+                        advance_algo_requests.push(request);
+                    } else {
+                        regular_algo_requests.push(request);
+                    }
+                }
+
+                if !regular_algo_requests.is_empty() {
+                    let client = http_client.clone();
+                    self.spawn_task("cancel_algo_orders", async move {
+                        client.cancel_algo_orders(regular_algo_requests).await?;
+                        Ok(())
+                    });
+                }
+
+                if !advance_algo_requests.is_empty() {
+                    self.spawn_task("cancel_advance_algo_orders", async move {
+                        http_client
+                            .cancel_advance_algo_orders(advance_algo_requests)
+                            .await?;
+                        Ok(())
+                    });
+                }
             }
 
             Ok(())
@@ -911,9 +1111,12 @@ impl ExecutionClient for OKXExecutionClient {
         // OKX doesn't support algo cancel via private WebSocket, must use HTTP
         if !algo_orders.is_empty() {
             let http_client = self.http_client.clone();
-            let requests: Vec<OKXCancelAlgoOrderRequest> = algo_orders
-                .into_iter()
-                .map(|cancel| OKXCancelAlgoOrderRequest {
+            let mut regular_algo_requests = Vec::new();
+            let mut advance_algo_requests = Vec::new();
+
+            let cache = self.core.cache();
+            for cancel in algo_orders {
+                let request = OKXCancelAlgoOrderRequest {
                     inst_id: cancel.instrument_id.symbol.to_string(),
                     inst_id_code: None,
                     algo_id: cancel.venue_order_id.map(|id| id.to_string()),
@@ -922,13 +1125,36 @@ impl ExecutionClient for OKXExecutionClient {
                     } else {
                         None
                     },
-                })
-                .collect();
+                };
 
-            self.spawn_task("cancel_algo_orders", async move {
-                http_client.cancel_algo_orders(requests).await?;
-                Ok(())
-            });
+                let is_advance = cache
+                    .order(&cancel.client_order_id)
+                    .is_some_and(|o| is_advance_algo_order(o.order_type()));
+
+                if is_advance {
+                    advance_algo_requests.push(request);
+                } else {
+                    regular_algo_requests.push(request);
+                }
+            }
+            drop(cache);
+
+            if !regular_algo_requests.is_empty() {
+                let client = http_client.clone();
+                self.spawn_task("cancel_algo_orders", async move {
+                    client.cancel_algo_orders(regular_algo_requests).await?;
+                    Ok(())
+                });
+            }
+
+            if !advance_algo_requests.is_empty() {
+                self.spawn_task("cancel_advance_algo_orders", async move {
+                    http_client
+                        .cancel_advance_algo_orders(advance_algo_requests)
+                        .await?;
+                    Ok(())
+                });
+            }
         }
 
         Ok(())
@@ -1014,6 +1240,7 @@ impl ExecutionClient for OKXExecutionClient {
         if let Some(start) = cmd.start {
             reports.retain(|r| r.ts_last >= start);
         }
+
         if let Some(end) = cmd.end {
             reports.retain(|r| r.ts_last <= end);
         }
@@ -1107,8 +1334,13 @@ impl ExecutionClient for OKXExecutionClient {
 
         reports.append(&mut margin_reports);
 
-        let _ = nanos_to_datetime(cmd.start);
-        let _ = nanos_to_datetime(cmd.end);
+        if let Some(start) = cmd.start {
+            reports.retain(|r| r.ts_last >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|r| r.ts_last <= end);
+        }
 
         Ok(reports)
     }
@@ -1171,11 +1403,16 @@ impl ExecutionClient for OKXExecutionClient {
     }
 }
 
-/// Dispatches a WebSocket message using the event emitter.
-fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitter) {
+/// Dispatches a WebSocket message with cross-stream deduplication.
+#[doc(hidden)]
+pub fn dispatch_ws_message(
+    message: NautilusWsMessage,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+) {
     match message {
-        NautilusWsMessage::AccountUpdate(state) => {
-            emitter.send_account_state(state);
+        NautilusWsMessage::AccountUpdate(account_state) => {
+            emitter.send_account_state(account_state);
         }
         NautilusWsMessage::PositionUpdate(report) => {
             emitter.send_position_report(report);
@@ -1185,24 +1422,78 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
             for report in reports {
                 match report {
                     ExecutionReport::Order(order_report) => {
+                        if let Some(cid) = order_report.client_order_id {
+                            match order_report.order_status {
+                                OrderStatus::Accepted => {
+                                    if state.filled_orders.contains(&cid)
+                                        || state.triggered_orders.contains(&cid)
+                                    {
+                                        log::debug!(
+                                            "Skipping stale OrderStatusReport(Accepted) \
+                                             for {cid} (already triggered/filled)"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                OrderStatus::Triggered => {
+                                    if state.filled_orders.contains(&cid) {
+                                        log::debug!(
+                                            "Skipping stale OrderStatusReport(Triggered) \
+                                             for {cid} (already filled)"
+                                        );
+                                        continue;
+                                    }
+                                    state.insert_triggered(cid);
+                                }
+                                OrderStatus::Filled => {
+                                    state.insert_filled(cid);
+                                    state.triggered_orders.remove(&cid);
+                                }
+                                OrderStatus::Canceled
+                                | OrderStatus::Expired
+                                | OrderStatus::Rejected => {
+                                    state.triggered_orders.remove(&cid);
+                                    state.filled_orders.remove(&cid);
+                                }
+                                _ => {}
+                            }
+                        }
                         emitter.send_order_status_report(order_report);
                     }
                     ExecutionReport::Fill(fill_report) => {
+                        if let Some(cid) = fill_report.client_order_id {
+                            state.insert_filled(cid);
+                            state.triggered_orders.remove(&cid);
+                        }
                         emitter.send_fill_report(fill_report);
                     }
                 }
             }
         }
         NautilusWsMessage::OrderAccepted(event) => {
+            let cid = event.client_order_id;
+            if state.filled_orders.contains(&cid) || state.triggered_orders.contains(&cid) {
+                log::debug!("Skipping stale OrderAccepted for {cid} (already triggered/filled)");
+                return;
+            }
             emitter.send_order_event(OrderEventAny::Accepted(event));
         }
         NautilusWsMessage::OrderCanceled(event) => {
+            let cid = event.client_order_id;
+            state.triggered_orders.remove(&cid);
+            state.filled_orders.remove(&cid);
             emitter.send_order_event(OrderEventAny::Canceled(event));
         }
         NautilusWsMessage::OrderExpired(event) => {
+            let cid = event.client_order_id;
+            state.triggered_orders.remove(&cid);
+            state.filled_orders.remove(&cid);
             emitter.send_order_event(OrderEventAny::Expired(event));
         }
         NautilusWsMessage::OrderRejected(event) => {
+            let cid = event.client_order_id;
+            state.triggered_orders.remove(&cid);
+            state.filled_orders.remove(&cid);
             emitter.send_order_event(OrderEventAny::Rejected(event));
         }
         NautilusWsMessage::OrderCancelRejected(event) => {
@@ -1212,6 +1503,12 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
             emitter.send_order_event(OrderEventAny::ModifyRejected(event));
         }
         NautilusWsMessage::OrderTriggered(event) => {
+            let cid = event.client_order_id;
+            if state.filled_orders.contains(&cid) {
+                log::debug!("Skipping stale OrderTriggered for {cid} (already filled)");
+                return;
+            }
+            state.insert_triggered(cid);
             emitter.send_order_event(OrderEventAny::Triggered(event));
         }
         NautilusWsMessage::OrderUpdated(event) => {
@@ -1235,7 +1532,8 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
         | NautilusWsMessage::Raw(_)
         | NautilusWsMessage::Data(_)
         | NautilusWsMessage::FundingRates(_)
-        | NautilusWsMessage::Instrument(_) => {
+        | NautilusWsMessage::Instrument(_, _)
+        | NautilusWsMessage::InstrumentStatus(_) => {
             log::debug!("Ignoring websocket data message");
         }
     }
@@ -1243,96 +1541,4 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
 
 fn nanos_to_datetime(value: Option<UnixNanos>) -> Option<DateTime<Utc>> {
     value.map(|nanos| nanos.to_datetime_utc())
-}
-
-#[cfg(test)]
-mod tests {
-    use nautilus_common::messages::execution::{BatchCancelOrders, CancelOrder};
-    use nautilus_core::{UUID4, UnixNanos};
-    use nautilus_model::identifiers::{
-        ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId,
-    };
-    use rstest::rstest;
-
-    #[rstest]
-    fn test_batch_cancel_orders_builds_payload() {
-        let trader_id = TraderId::from("TRADER-001");
-        let strategy_id = StrategyId::from("STRATEGY-001");
-        let client_id = Some(ClientId::from("OKX"));
-        let instrument_id = InstrumentId::from("BTC-USDT.OKX");
-        let client_order_id1 = ClientOrderId::new("order1");
-        let client_order_id2 = ClientOrderId::new("order2");
-        let venue_order_id1 = VenueOrderId::new("venue1");
-        let venue_order_id2 = VenueOrderId::new("venue2");
-
-        let cmd = BatchCancelOrders {
-            trader_id,
-            client_id,
-            strategy_id,
-            instrument_id,
-            cancels: vec![
-                CancelOrder {
-                    trader_id,
-                    client_id,
-                    strategy_id,
-                    instrument_id,
-                    client_order_id: client_order_id1,
-                    venue_order_id: Some(venue_order_id1),
-                    command_id: UUID4::default(),
-                    ts_init: UnixNanos::default(),
-                    params: None,
-                },
-                CancelOrder {
-                    trader_id,
-                    client_id,
-                    strategy_id,
-                    instrument_id,
-                    client_order_id: client_order_id2,
-                    venue_order_id: Some(venue_order_id2),
-                    command_id: UUID4::default(),
-                    ts_init: UnixNanos::default(),
-                    params: None,
-                },
-            ],
-            command_id: UUID4::default(),
-            ts_init: UnixNanos::default(),
-            params: None,
-        };
-
-        // Verify we can build the payload structure
-        let mut payload = Vec::with_capacity(cmd.cancels.len());
-        for cancel in &cmd.cancels {
-            payload.push((
-                cancel.instrument_id,
-                Some(cancel.client_order_id),
-                cancel.venue_order_id,
-            ));
-        }
-
-        assert_eq!(payload.len(), 2);
-        assert_eq!(payload[0].0, instrument_id);
-        assert_eq!(payload[0].1, Some(client_order_id1));
-        assert_eq!(payload[0].2, Some(venue_order_id1));
-        assert_eq!(payload[1].0, instrument_id);
-        assert_eq!(payload[1].1, Some(client_order_id2));
-        assert_eq!(payload[1].2, Some(venue_order_id2));
-    }
-
-    #[rstest]
-    fn test_batch_cancel_orders_with_empty_cancels() {
-        let cmd = BatchCancelOrders {
-            trader_id: TraderId::from("TRADER-001"),
-            client_id: Some(ClientId::from("OKX")),
-            strategy_id: StrategyId::from("STRATEGY-001"),
-            instrument_id: InstrumentId::from("BTC-USDT.OKX"),
-            cancels: vec![],
-            command_id: UUID4::default(),
-            ts_init: UnixNanos::default(),
-            params: None,
-        };
-
-        let payload: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)> =
-            Vec::with_capacity(cmd.cancels.len());
-        assert_eq!(payload.len(), 0);
-    }
 }

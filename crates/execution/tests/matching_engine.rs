@@ -227,6 +227,7 @@ fn order_event_handler_with_cache(
         TypedIntoHandler::from(move |event: OrderEventAny| {
             // Apply event to cached order (simulates exec engine)
             let client_order_id = event.client_order_id();
+
             if let Ok(mut cache_ref) = cache.try_borrow_mut()
                 && let Some(order) = cache_ref.mut_order(&client_order_id)
             {
@@ -5541,10 +5542,7 @@ fn test_price_protection_exact_boundary_fills(
 ) {
     // Protection of 100 points on ETHUSDT (price_increment=0.01) means
     // max BUY price = ask + 100 * 0.01 = ask + 1.00
-    let config = OrderMatchingEngineConfig {
-        ..Default::default()
-    }
-    .with_price_protection_points(Some(100));
+    let config = OrderMatchingEngineConfig::default().with_price_protection_points(Some(100));
 
     let mut engine_l2 =
         get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, Some(config), None);

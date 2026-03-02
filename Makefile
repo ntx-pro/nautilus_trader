@@ -118,15 +118,17 @@ RESET  := \033[0m
 .PHONY: install-deps
 install-deps:  #-- Install Python dependencies only (no package build)
 	$(info $(M) Installing Python dependencies...)
-	$Q uv sync --active --all-groups --all-extras --no-install-package nautilus_trader
+	$Q uv sync --active --all-groups --all-extras --inexact --no-install-package nautilus_trader
 
 .PHONY: install
+install: install-deps
 install: export BUILD_MODE=release
 install:  #-- Install in release mode with all dependencies and extras
 	$(info $(M) Installing NautilusTrader in release mode...)
 	$Q uv sync --active --all-groups --all-extras --inexact
 
 .PHONY: install-debug
+install-debug: install-deps
 install-debug: export BUILD_MODE=debug
 install-debug:  #-- Install in debug mode for development
 	$(info $(M) Installing NautilusTrader in debug mode...)
@@ -135,12 +137,14 @@ install-debug:  #-- Install in debug mode for development
 #== Build
 
 .PHONY: build
+build: install-deps
 build: export BUILD_MODE=release
 build: export CARGO_TARGET_DIR=$(TARGET_DIR)
 build:  #-- Build the package in release mode
 	uv run --active --no-sync build.py
 
 .PHONY: build-debug
+build-debug: install-deps
 build-debug: export BUILD_MODE=debug
 build-debug: export CARGO_TARGET_DIR=$(TARGET_DIR)
 build-debug:  #-- Build the package in debug mode (recommended for development)
@@ -315,7 +319,7 @@ install-tools:  #-- Install required development tools (Rust tools from Cargo.to
 #== Security
 
 .PHONY: security-audit
-security-audit: check-audit-installed check-deny-installed check-vet-installed check-osv-scanner-installed  #-- Run comprehensive security audit (cargo-audit, cargo-deny, cargo-vet, osv-scanner)
+security-audit: check-audit-installed check-deny-installed check-vet-installed check-osv-scanner-installed  #-- Run comprehensive security audit (cargo-audit, cargo-deny, cargo-vet, pip-audit, osv-scanner)
 	$(info $(M) Running security audit...)
 	@printf "$(CYAN)Running cargo audit...$(RESET)\n"
 	cargo audit --color never
@@ -323,6 +327,8 @@ security-audit: check-audit-installed check-deny-installed check-vet-installed c
 	cargo deny --all-features check advisories licenses sources bans
 	@printf "\n$(CYAN)Running cargo vet (supply chain audit)...$(RESET)\n"
 	cargo vet --locked
+	@printf "\n$(CYAN)Running pip-audit (Python dependencies)...$(RESET)\n"
+	uv export --no-hashes --frozen | uv run --no-project --with pip-audit -- pip-audit --disable-pip --no-deps -r /dev/stdin
 	@printf "\n$(CYAN)Running osv-scanner (Cargo.lock + uv.lock)...$(RESET)\n"
 	osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=uv.lock
 

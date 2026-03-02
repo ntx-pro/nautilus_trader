@@ -70,6 +70,7 @@ cdef class MatchingCore:
         self._trigger_stop_order = trigger_stop_order
         self._fill_market_order = fill_market_order
         self._fill_limit_order = fill_limit_order
+        self._fill_limit_inside_spread = False
 
         # Orders
         self._orders: dict[ClientOrderId, Order] = {}
@@ -241,10 +242,21 @@ cdef class MatchingCore:
             raise RuntimeError(f"invalid `OrderSide`, was {order.side}")  # pragma: no cover (design-time error)
 
     cpdef void iterate(self, uint64_t timestamp_ns):
+        # Snapshot both sides upfront so synchronous callbacks during
+        # bid matching cannot alter the ask snapshot (and vice versa)
+        cdef list orders_bid = self._orders_bid[:]
+        cdef list orders_ask = self._orders_ask[:]
+
         cdef Order order
-        for order in self._orders_bid + self._orders_ask:  # Lists implicitly copied
+
+        for order in orders_bid:
             if order.is_closed_c():
-                continue  # Orders state has changed since iteration started  # pragma: no cover
+                continue  # pragma: no cover
+            self.match_order(order)
+
+        for order in orders_ask:
+            if order.is_closed_c():
+                continue  # pragma: no cover
             self.match_order(order)
 
 # -- MATCHING -------------------------------------------------------------------------------------
@@ -364,8 +376,26 @@ cdef class MatchingCore:
         if order.is_activated:
             self.match_stop_market_order(order)
 
+    cpdef void set_fill_limit_inside_spread(self, bint value):
+        self._fill_limit_inside_spread = value
+
     cpdef bint is_limit_fillable(self, OrderSide side, Price price):
-        return self.is_limit_marketable(side, price)
+        if self.is_limit_marketable(side, price):
+            return True
+
+        if not self._fill_limit_inside_spread:
+            return False
+
+        # Require both sides initialized since fill simulation needs best bid and ask
+        if not self.is_bid_initialized or not self.is_ask_initialized:
+            return False
+
+        if side == OrderSide.BUY:
+            return price._mem.raw >= self.bid_raw
+        elif side == OrderSide.SELL:
+            return price._mem.raw <= self.ask_raw
+
+        return False
 
     cpdef bint is_limit_marketable(self, OrderSide side, Price price):
         # True when order would take liquidity (crosses the spread). Used for post-only rejection.

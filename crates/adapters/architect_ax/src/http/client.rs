@@ -277,7 +277,7 @@ impl AxRawHttpClient {
     ///
     /// Panics if the internal lock is poisoned (indicates a panic in another thread).
     pub fn set_session_token(&self, token: String) {
-        // SAFETY: Lock poisoning indicates a panic in another thread, which is fatal
+        // Lock poisoning indicates a panic in another thread, which is fatal
         *self.session_token.write().expect("Lock poisoned") = Some(token);
     }
 
@@ -300,7 +300,7 @@ impl AxRawHttpClient {
     }
 
     fn auth_headers(&self) -> Result<HashMap<String, String>, AxHttpError> {
-        // SAFETY: Lock poisoning indicates a panic in another thread, which is fatal
+        // Lock poisoning indicates a panic in another thread, which is fatal
         let guard = self.session_token.read().expect("Lock poisoned");
         let session_token = guard.as_ref().ok_or(AxHttpError::MissingSessionToken)?;
 
@@ -1427,6 +1427,7 @@ impl AxHttpClient {
                     if start.is_some_and(|s| tick.ts_event < s) {
                         continue;
                     }
+
                     if end.is_some_and(|e| tick.ts_event > e) {
                         continue;
                     }

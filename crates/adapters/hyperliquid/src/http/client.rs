@@ -58,14 +58,7 @@ use ustr::Ustr;
 
 use crate::{
     common::{
-        builder_fee::{
-            resolve_builder_fee, resolve_builder_fee_batch, resolve_maker_tenths_bp,
-            resolve_taker_tenths_bp,
-        },
-        consts::{
-            HYPERLIQUID_VENUE, NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP,
-            NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP, exchange_url, info_url,
-        },
+        consts::{HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS, exchange_url, info_url},
         credential::{Secrets, VaultAddress},
         enums::{
             HyperliquidBarInterval, HyperliquidOrderStatus as HyperliquidOrderStatusEnum,
@@ -73,17 +66,18 @@ use crate::{
         },
         parse::{
             bar_type_to_interval, clamp_price_to_precision, derive_limit_from_trigger,
-            normalize_price, order_to_hyperliquid_request_with_asset, round_to_sig_figs,
+            extract_inner_error, normalize_price, order_to_hyperliquid_request_with_asset,
+            round_to_sig_figs, time_in_force_to_hyperliquid_tif,
         },
     },
     http::{
         error::{Error, Result},
         models::{
             Cloid, HyperliquidCandleSnapshot, HyperliquidExchangeRequest,
-            HyperliquidExchangeResponse, HyperliquidExecAction,
+            HyperliquidExchangeResponse, HyperliquidExecAction, HyperliquidExecBuilderFee,
             HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelOrderRequest,
-            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecOrderKind,
-            HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
+            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecModifyOrderRequest,
+            HyperliquidExecOrderKind, HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
             HyperliquidExecPlaceOrderRequest, HyperliquidExecTif, HyperliquidExecTpSl,
             HyperliquidExecTriggerParams, HyperliquidFills, HyperliquidL2Book, HyperliquidMeta,
             HyperliquidOrderStatus, PerpMeta, PerpMetaAndCtxs, RESPONSE_STATUS_OK, SpotMeta,
@@ -759,10 +753,6 @@ pub struct HyperliquidHttpClient {
     spot_fill_coins: Arc<RwLock<AHashMap<Ustr, Ustr>>>,
     account_id: Option<AccountId>,
     normalize_prices: bool,
-    /// Dynamic builder maker fee in tenths of a basis point (volume-tier adjusted).
-    builder_maker_tenths_bp: Arc<RwLock<u32>>,
-    /// Dynamic builder taker fee in tenths of a basis point (volume-tier adjusted).
-    builder_taker_tenths_bp: Arc<RwLock<u32>>,
 }
 
 impl Default for HyperliquidHttpClient {
@@ -811,45 +801,7 @@ impl HyperliquidHttpClient {
             spot_fill_coins: Arc::new(RwLock::new(AHashMap::new())),
             account_id: None,
             normalize_prices: true,
-            builder_maker_tenths_bp: Arc::new(RwLock::new(NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP)),
-            builder_taker_tenths_bp: Arc::new(RwLock::new(NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP)),
         }
-    }
-
-    /// Returns the current builder maker fee in tenths of a basis point.
-    #[must_use]
-    #[allow(clippy::missing_panics_doc)]
-    pub fn builder_maker_tenths_bp(&self) -> u32 {
-        *self.builder_maker_tenths_bp.read().unwrap()
-    }
-
-    /// Returns the current builder taker fee in tenths of a basis point.
-    #[must_use]
-    #[allow(clippy::missing_panics_doc)]
-    pub fn builder_taker_tenths_bp(&self) -> u32 {
-        *self.builder_taker_tenths_bp.read().unwrap()
-    }
-
-    /// Updates builder fee tiers from the HL effective rates.
-    ///
-    /// Returns `((maker_old, maker_new), (taker_old, taker_new))`.
-    #[allow(clippy::missing_panics_doc)]
-    pub fn update_builder_fees(
-        &self,
-        user_add_rate: f64,
-        user_cross_rate: f64,
-    ) -> ((u32, u32), (u32, u32)) {
-        let maker_new = resolve_maker_tenths_bp(user_add_rate);
-        let mut maker_guard = self.builder_maker_tenths_bp.write().unwrap();
-        let maker_old = *maker_guard;
-        *maker_guard = maker_new;
-
-        let taker_new = resolve_taker_tenths_bp(user_cross_rate);
-        let mut taker_guard = self.builder_taker_tenths_bp.write().unwrap();
-        let taker_old = *taker_guard;
-        *taker_guard = taker_new;
-
-        ((maker_old, maker_new), (taker_old, taker_new))
     }
 
     /// Overrides the base info URL (for testing with mock servers).
@@ -890,8 +842,6 @@ impl HyperliquidHttpClient {
             spot_fill_coins: Arc::new(RwLock::new(AHashMap::new())),
             account_id: None,
             normalize_prices: true,
-            builder_maker_tenths_bp: Arc::new(RwLock::new(NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP)),
-            builder_taker_tenths_bp: Arc::new(RwLock::new(NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP)),
         })
     }
 
@@ -956,12 +906,6 @@ impl HyperliquidHttpClient {
                     spot_fill_coins: Arc::new(RwLock::new(AHashMap::new())),
                     account_id: None,
                     normalize_prices: true,
-                    builder_maker_tenths_bp: Arc::new(RwLock::new(
-                        NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP,
-                    )),
-                    builder_taker_tenths_bp: Arc::new(RwLock::new(
-                        NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP,
-                    )),
                 })
             }
             None => {
@@ -1000,8 +944,6 @@ impl HyperliquidHttpClient {
             spot_fill_coins: Arc::new(RwLock::new(AHashMap::new())),
             account_id: None,
             normalize_prices: true,
-            builder_maker_tenths_bp: Arc::new(RwLock::new(NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP)),
-            builder_taker_tenths_bp: Arc::new(RwLock::new(NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP)),
         })
     }
 
@@ -1117,6 +1059,7 @@ impl HyperliquidHttpClient {
             {
                 return Some(instrument.clone());
             }
+
             if let Some(instrument) =
                 instruments_by_coin.get(&(*coin, HyperliquidProductType::Spot))
             {
@@ -1130,6 +1073,7 @@ impl HyperliquidHttpClient {
                 .spot_fill_coins
                 .read()
                 .expect("Failed to acquire read lock");
+
             if let Some(symbol) = spot_fill_coins.get(coin) {
                 // Look up by full symbol in instruments map (not instruments_by_coin
                 // which uses raw_symbol)
@@ -1137,6 +1081,7 @@ impl HyperliquidHttpClient {
                     .instruments
                     .read()
                     .expect("Failed to acquire read lock");
+
                 if let Some(instrument) = instruments.get(symbol) {
                     return Some(instrument.clone());
                 }
@@ -1502,6 +1447,141 @@ impl HyperliquidHttpClient {
             ))),
             HyperliquidExchangeResponse::Error { error } => {
                 Err(Error::bad_request(format!("Cancel order error: {error}")))
+            }
+        }
+    }
+
+    /// Modify an order on the Hyperliquid exchange.
+    ///
+    /// The HL modify API requires a full replacement order spec plus the
+    /// venue order ID. The caller must provide all order fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the asset index is not found, the venue order ID
+    /// is invalid, or the API returns an error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn modify_order(
+        &self,
+        instrument_id: InstrumentId,
+        venue_order_id: VenueOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        price: Price,
+        quantity: Quantity,
+        trigger_price: Option<Price>,
+        reduce_only: bool,
+        post_only: bool,
+        time_in_force: TimeInForce,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Result<()> {
+        let symbol = instrument_id.symbol.as_str();
+        let asset_id = self.get_asset_index(symbol).ok_or_else(|| {
+            Error::bad_request(format!(
+                "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
+            ))
+        })?;
+
+        let oid: u64 = venue_order_id
+            .as_str()
+            .parse()
+            .map_err(|_| Error::bad_request("Invalid venue order ID format"))?;
+
+        let is_buy = matches!(order_side, OrderSide::Buy);
+        let decimals = self.get_price_precision(symbol).unwrap_or(2);
+
+        let normalized_price = if self.normalize_prices {
+            normalize_price(price.as_decimal(), decimals).normalize()
+        } else {
+            price.as_decimal().normalize()
+        };
+
+        let size = quantity.as_decimal().normalize();
+        let cloid = client_order_id.map(Cloid::from_client_order_id);
+
+        let kind = match order_type {
+            OrderType::Market => HyperliquidExecOrderKind::Limit {
+                limit: HyperliquidExecLimitParams {
+                    tif: HyperliquidExecTif::Ioc,
+                },
+            },
+            OrderType::Limit => {
+                let tif = time_in_force_to_hyperliquid_tif(time_in_force, post_only)
+                    .map_err(|e| Error::bad_request(format!("{e}")))?;
+                HyperliquidExecOrderKind::Limit {
+                    limit: HyperliquidExecLimitParams { tif },
+                }
+            }
+            OrderType::StopMarket
+            | OrderType::StopLimit
+            | OrderType::MarketIfTouched
+            | OrderType::LimitIfTouched => {
+                if let Some(trig_px) = trigger_price {
+                    let trigger_price_decimal = if self.normalize_prices {
+                        normalize_price(trig_px.as_decimal(), decimals).normalize()
+                    } else {
+                        trig_px.as_decimal().normalize()
+                    };
+                    let tpsl = match order_type {
+                        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExecTpSl::Sl,
+                        _ => HyperliquidExecTpSl::Tp,
+                    };
+                    let is_market = matches!(
+                        order_type,
+                        OrderType::StopMarket | OrderType::MarketIfTouched
+                    );
+                    HyperliquidExecOrderKind::Trigger {
+                        trigger: HyperliquidExecTriggerParams {
+                            is_market,
+                            trigger_px: trigger_price_decimal,
+                            tpsl,
+                        },
+                    }
+                } else {
+                    return Err(Error::bad_request("Trigger orders require a trigger price"));
+                }
+            }
+            _ => {
+                return Err(Error::bad_request(format!(
+                    "Order type {order_type:?} not supported for modify"
+                )));
+            }
+        };
+
+        let order = HyperliquidExecPlaceOrderRequest {
+            asset: asset_id,
+            is_buy,
+            price: normalized_price,
+            size,
+            reduce_only,
+            kind,
+            cloid,
+        };
+
+        let action = HyperliquidExecAction::Modify {
+            modify: HyperliquidExecModifyOrderRequest { oid, order },
+        };
+
+        let response = self.inner.post_action_exec(&action).await?;
+
+        match response {
+            ref r @ HyperliquidExchangeResponse::Status { .. } if r.is_ok() => {
+                if let Some(inner_error) = extract_inner_error(&response) {
+                    Err(Error::bad_request(format!(
+                        "Modify order rejected: {inner_error}",
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            HyperliquidExchangeResponse::Status {
+                status,
+                response: error_data,
+            } => Err(Error::bad_request(format!(
+                "Modify order failed: status={status}, error={error_data}"
+            ))),
+            HyperliquidExchangeResponse::Error { error } => {
+                Err(Error::bad_request(format!("Modify order error: {error}")))
             }
         }
     }
@@ -2025,12 +2105,10 @@ impl HyperliquidHttpClient {
         let action = HyperliquidExecAction::Order {
             orders: vec![hyperliquid_order],
             grouping: HyperliquidExecGrouping::Na,
-            builder: resolve_builder_fee(
-                symbol,
-                post_only,
-                self.builder_maker_tenths_bp(),
-                self.builder_taker_tenths_bp(),
-            ),
+            builder: Some(HyperliquidExecBuilderFee {
+                address: NAUTILUS_BUILDER_ADDRESS.to_string(),
+                fee_tenths_bp: 0,
+            }),
         };
 
         let response = self.inner.post_action_exec(&action).await?;
@@ -2224,22 +2302,13 @@ impl HyperliquidHttpClient {
             hyperliquid_orders.push(request);
         }
 
-        let order_props: Vec<(String, bool)> = orders
-            .iter()
-            .map(|o| (o.instrument_id().symbol.to_string(), o.is_post_only()))
-            .collect();
-        let batch_refs: Vec<(&str, bool)> =
-            order_props.iter().map(|(s, p)| (s.as_str(), *p)).collect();
-        let builder = resolve_builder_fee_batch(
-            &batch_refs,
-            self.builder_maker_tenths_bp(),
-            self.builder_taker_tenths_bp(),
-        );
-
         let action = HyperliquidExecAction::Order {
             orders: hyperliquid_orders,
             grouping: HyperliquidExecGrouping::Na,
-            builder,
+            builder: Some(HyperliquidExecBuilderFee {
+                address: NAUTILUS_BUILDER_ADDRESS.to_string(),
+                fee_tenths_bp: 0,
+            }),
         };
 
         // Submit to exchange using the typed exec endpoint
@@ -2375,13 +2444,7 @@ mod tests {
     use ustr::Ustr;
 
     use super::HyperliquidHttpClient;
-    use crate::{
-        common::{
-            consts::{NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP, NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP},
-            enums::HyperliquidProductType,
-        },
-        http::query::InfoRequest,
-    };
+    use crate::{common::enums::HyperliquidProductType, http::query::InfoRequest};
 
     #[rstest]
     fn stable_json_roundtrips() {
@@ -2507,66 +2570,5 @@ mod tests {
             client.get_or_create_instrument(&Ustr::from("vntls:vCURSOR"), None);
         assert!(retrieved_without_type.is_some());
         assert_eq!(retrieved_without_type.unwrap().id(), instrument.id());
-    }
-
-    #[rstest]
-    fn test_builder_fee_defaults() {
-        let client = HyperliquidHttpClient::default();
-        assert_eq!(
-            client.builder_maker_tenths_bp(),
-            NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP,
-        );
-        assert_eq!(
-            client.builder_taker_tenths_bp(),
-            NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP,
-        );
-    }
-
-    #[rstest]
-    fn test_update_builder_fees_returns_old_and_new() {
-        let client = HyperliquidHttpClient::default();
-        let ((maker_old, maker_new), (taker_old, taker_new)) =
-            client.update_builder_fees(0.000_10, 0.000_30);
-        assert_eq!(maker_old, NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP);
-        assert_eq!(maker_new, 3);
-        assert_eq!(client.builder_maker_tenths_bp(), 3);
-        assert_eq!(taker_old, NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP);
-        assert_eq!(taker_new, 8);
-        assert_eq!(client.builder_taker_tenths_bp(), 8);
-    }
-
-    #[rstest]
-    fn test_update_builder_fees_successive_updates() {
-        let client = HyperliquidHttpClient::default();
-
-        let ((_, maker_new), (_, taker_new)) = client.update_builder_fees(0.000_10, 0.000_25);
-        assert_eq!(maker_new, 3);
-        assert_eq!(taker_new, 6);
-
-        let ((maker_old, maker_new), (taker_old, taker_new)) =
-            client.update_builder_fees(0.0, 0.000_10);
-        assert_eq!(maker_old, 3);
-        assert_eq!(maker_new, 0);
-        assert_eq!(taker_old, 6);
-        assert_eq!(taker_new, 2);
-
-        // Back up
-        let ((maker_old, maker_new), (taker_old, taker_new)) =
-            client.update_builder_fees(0.000_15, 0.000_35);
-        assert_eq!(maker_old, 0);
-        assert_eq!(maker_new, 4);
-        assert_eq!(taker_old, 2);
-        assert_eq!(taker_new, 10);
-    }
-
-    #[rstest]
-    fn test_update_builder_fees_unchanged() {
-        let client = HyperliquidHttpClient::default();
-        let ((maker_old, maker_new), (taker_old, taker_new)) =
-            client.update_builder_fees(0.000_15, 0.000_35);
-        assert_eq!(maker_old, maker_new);
-        assert_eq!(maker_new, NAUTILUS_BUILDER_FEE_MAKER_TENTHS_BP);
-        assert_eq!(taker_old, taker_new);
-        assert_eq!(taker_new, NAUTILUS_BUILDER_FEE_TAKER_TENTHS_BP);
     }
 }
