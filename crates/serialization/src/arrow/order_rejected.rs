@@ -38,6 +38,7 @@ impl ArrowSchemaProvider for OrderRejected {
             Field::new("ts_event", DataType::UInt64, false),
             Field::new("ts_init", DataType::UInt64, false),
             Field::new("reconciliation", DataType::UInt8, false),
+            Field::new("due_post_only", DataType::UInt8, false),
         ];
 
         match metadata {
@@ -62,6 +63,7 @@ impl EncodeToRecordBatch for OrderRejected {
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
         let mut reconciliation_builder = UInt8Array::builder(data.len());
+        let mut due_post_only_builder = UInt8Array::builder(data.len());
 
         for event in data {
             trader_id_builder.append_value(event.trader_id.as_str());
@@ -74,6 +76,7 @@ impl EncodeToRecordBatch for OrderRejected {
             ts_event_builder.append_value(event.ts_event.as_u64());
             ts_init_builder.append_value(event.ts_init.as_u64());
             reconciliation_builder.append_value(event.reconciliation);
+            due_post_only_builder.append_value(event.due_post_only);
         }
 
         RecordBatch::try_new(
@@ -89,6 +92,7 @@ impl EncodeToRecordBatch for OrderRejected {
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
                 Arc::new(reconciliation_builder.finish()),
+                Arc::new(due_post_only_builder.finish()),
             ],
         )
     }
@@ -110,7 +114,7 @@ mod tests {
         let schema = OrderRejected::get_schema(None);
         let fields = schema.fields();
 
-        assert_eq!(fields.len(), 10);
+        assert_eq!(fields.len(), 11);
 
         assert_eq!(fields[0].name(), "trader_id");
         assert_eq!(fields[0].data_type(), &DataType::Utf8);
@@ -136,6 +140,10 @@ mod tests {
         assert_eq!(fields[9].name(), "reconciliation");
         assert_eq!(fields[9].data_type(), &DataType::UInt8);
         assert!(!fields[9].is_nullable());
+
+        assert_eq!(fields[10].name(), "due_post_only");
+        assert_eq!(fields[10].data_type(), &DataType::UInt8);
+        assert!(!fields[10].is_nullable());
     }
 
     #[rstest]
@@ -145,7 +153,7 @@ mod tests {
         let record_batch = OrderRejected::encode_batch(&metadata, &[event]).expect("encode failed");
 
         assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 10);
+        assert_eq!(record_batch.num_columns(), 11);
     }
 
     #[rstest]
@@ -162,6 +170,6 @@ mod tests {
             OrderRejected::encode_batch(&metadata, &data).expect("encode failed");
 
         assert_eq!(record_batch.num_rows(), 2);
-        assert_eq!(record_batch.num_columns(), 10);
+        assert_eq!(record_batch.num_columns(), 11);
     }
 }
