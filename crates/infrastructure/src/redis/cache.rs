@@ -1611,12 +1611,26 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         let op = DatabaseCommand::new(
             DatabaseOperation::Insert,
             INDEX_POSITIONS_OPEN.to_string(),
+            Some(vec![position_id_bytes.clone()]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send position open index command: {e}"))?;
+
+        // Clean up stale closed index entry for NETTING mode position flips.
+        // When a position flips direction (e.g., long -> flat -> short) with the same
+        // position ID, the previous close leaves the ID in index:positions_closed.
+        // Without this cleanup, the ID appears in both open AND closed indexes.
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Delete,
+            INDEX_POSITIONS_CLOSED.to_string(),
             Some(vec![position_id_bytes]),
         );
         self.database
             .tx
             .send(op)
-            .map_err(|e| anyhow::anyhow!("Failed to send position open index command: {e}"))
+            .map_err(|e| anyhow::anyhow!("Failed to send position closed index cleanup: {e}"))
     }
 
     /// Persists a pre-built position snapshot to Redis.

@@ -188,6 +188,8 @@ looks up the code in `CURRENCY_MAP` to reconstruct the full `Currency` object.
 | `delete_account_event` | No-op | Pending redesign of account event storage |
 | Currency serialization | Rust-only | Rust writes code string, Cython writes full dict. Cross-language incompatible. |
 | Heartbeat format | Rust-only | Rust writes `UnixNanos` integer string, Cython writes ISO8601. |
+| Order transforms | Not handled | `load_order` does not handle order type transforms (duplicate `OrderInitialized` events). Rare edge case for conditional orders. |
+| Position fill assertions | Panics | `Position::new()` panics on corrupted fill data (missing position_id, mismatched instrument_id). Upstream NT design choice. |
 
 ## Bug Fixes
 
@@ -219,6 +221,24 @@ in the upstream codebase:
 6. **`load()` general state recovery** (`f2d91e505`): Was returning an empty map.
    Now scans `general:*` keys and returns all persisted key-value state for startup
    recovery.
+
+### Event Replay Implementations
+
+The following load methods now implement full event replay from Redis lists,
+matching the Cython behavior:
+
+- **`load_order`**: Replays `OrderEventAny` events via `OrderAny::from_events()`.
+  Falls back to direct deserialization for legacy data.
+- **`load_account`**: Replays `AccountState` events via `AccountAny::from_events()`.
+  Falls back to direct deserialization for legacy data.
+- **`load_position`**: Replays `OrderFilled` events, loads the instrument from Redis,
+  constructs `Position::new(&instrument, initial_fill)`, then applies remaining fills.
+  Falls back to direct deserialization for legacy data.
+
+All three follow the same pattern: read all list elements, deserialize as the
+event type, reconstruct the full object via the appropriate factory/replay method.
+The bulk load methods (`load_orders`, `load_accounts`, `load_positions`) delegate
+to these singular methods and benefit from event replay automatically.
 
 ## Testing
 
