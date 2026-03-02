@@ -3278,11 +3278,16 @@ impl_catalog_path_prefix!(nautilus_model::events::order::submitted::OrderSubmitt
 impl_catalog_path_prefix!(nautilus_model::events::order::denied::OrderDenied, "order_denials");
 impl_catalog_path_prefix!(nautilus_model::events::order::expired::OrderExpired, "order_expirations");
 impl_catalog_path_prefix!(nautilus_model::events::order::triggered::OrderTriggered, "order_triggers");
+impl_catalog_path_prefix!(nautilus_model::events::order::cancel_rejected::OrderCancelRejected, "order_cancel_rejects");
+impl_catalog_path_prefix!(nautilus_model::events::order::modify_rejected::OrderModifyRejected, "order_modify_rejects");
+impl_catalog_path_prefix!(nautilus_model::events::order::emulated::OrderEmulated, "order_emulations");
+impl_catalog_path_prefix!(nautilus_model::events::order::released::OrderReleased, "order_releases");
 impl_catalog_path_prefix!(nautilus_model::events::account::state::AccountState, "account_states");
 impl_catalog_path_prefix!(nautilus_model::data::funding::FundingRateUpdate, "funding_rates");
 impl_catalog_path_prefix!(nautilus_model::events::position::opened::PositionOpened, "position_opens");
 impl_catalog_path_prefix!(nautilus_model::events::position::changed::PositionChanged, "position_changes");
 impl_catalog_path_prefix!(nautilus_model::events::position::closed::PositionClosed, "position_closes");
+impl_catalog_path_prefix!(nautilus_model::events::position::adjusted::PositionAdjusted, "position_adjustments");
 
 /// Converts timestamps to a filename using ISO 8601 format.
 ///
