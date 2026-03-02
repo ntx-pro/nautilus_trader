@@ -330,11 +330,6 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading instrument data fails.
-    /// Loads all instruments for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading instrument data fails.
     pub async fn load_instruments(
         con: &ConnectionManager,
         trader_key: &str,
@@ -394,11 +389,6 @@ impl DatabaseQueries {
         Ok(instruments)
     }
 
-    /// Loads all synthetic instruments for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading synthetic instrument data fails.
     /// Loads all synthetic instruments for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
@@ -468,11 +458,6 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading account data fails.
-    /// Loads all accounts for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading account data fails.
     pub async fn load_accounts(
         con: &ConnectionManager,
         trader_key: &str,
@@ -524,11 +509,6 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading order data fails.
-    /// Loads all orders for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading order data fails.
     pub async fn load_orders(
         con: &ConnectionManager,
         trader_key: &str,
@@ -575,11 +555,6 @@ impl DatabaseQueries {
         Ok(orders)
     }
 
-    /// Loads all positions for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading position data fails.
     /// Loads all positions for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
@@ -764,6 +739,12 @@ impl DatabaseQueries {
     /// Falls back to direct deserialization for backward compatibility with
     /// data that may have been written in a different format.
     ///
+    /// Note: Order transforms (where a second `OrderInitialized` event appears in the
+    /// list, e.g., when a StopLimit triggers and becomes a Limit) are not handled by
+    /// `OrderAny::from_events()`, which rejects duplicate Initialized events. The
+    /// fallback path will attempt direct deserialization in this case. This is a rare
+    /// edge case that does not affect standard order flows.
+    ///
     /// # Errors
     ///
     /// Returns an error if both event replay and fallback deserialization fail.
@@ -828,6 +809,12 @@ impl DatabaseQueries {
     ///
     /// Falls back to direct `Position` deserialization for backward
     /// compatibility with data that may have been written in a different format.
+    ///
+    /// Note: `Position::new()` and `Position::apply()` use panicking assertions for
+    /// invariant violations (missing position_id, mismatched instrument_id, duplicate
+    /// trade_id). Corrupted fill data in Redis will cause a panic rather than a
+    /// graceful error. This is an upstream NT design choice -- the adapter trusts
+    /// that persisted fill data was validated at write time.
     ///
     /// # Errors
     ///
