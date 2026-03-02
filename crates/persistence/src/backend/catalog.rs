@@ -3267,6 +3267,9 @@ impl_catalog_path_prefix!(MarkPriceUpdate, "mark_prices");
 impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
 impl_catalog_path_prefix!(InstrumentAny, "instruments");
 impl_catalog_path_prefix!(nautilus_model::events::order::filled::OrderFilled, "order_fills");
+impl_catalog_path_prefix!(nautilus_model::events::order::accepted::OrderAccepted, "order_accepts");
+impl_catalog_path_prefix!(nautilus_model::events::order::canceled::OrderCanceled, "order_cancels");
+impl_catalog_path_prefix!(nautilus_model::events::order::rejected::OrderRejected, "order_rejects");
 
 /// Converts timestamps to a filename using ISO 8601 format.
 ///
