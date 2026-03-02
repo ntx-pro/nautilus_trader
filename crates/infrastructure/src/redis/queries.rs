@@ -768,7 +768,7 @@ impl DatabaseQueries {
     async fn read_index(conn: &mut ConnectionManager, key: &str) -> anyhow::Result<Vec<Bytes>> {
         let index_key = get_index_key(key)?;
         match index_key {
-            INDEX_ORDER_IDS => Self::read_set(conn, key).await,
+            INDEX_ORDER_IDS => Self::read_hset(conn, key).await,
             INDEX_ORDER_POSITION => Self::read_hset(conn, key).await,
             INDEX_ORDER_CLIENT => Self::read_hset(conn, key).await,
             INDEX_ORDERS => Self::read_set(conn, key).await,
