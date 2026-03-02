@@ -60,6 +60,7 @@ use nautilus_cryptography::providers::install_cryptographic_provider;
 use nautilus_model::{
     accounts::AccountAny,
     data::{Bar, DataType, FundingRateUpdate, QuoteTick, TradeTick},
+    enums::TriggerType,
     events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
         AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
@@ -67,7 +68,7 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     position::Position,
     types::Currency,
 };
@@ -1327,8 +1328,83 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to send add_account command: {e}"))
     }
 
+    /// Persists an order's last event and updates all relevant indexes.
+    ///
+    /// Stores the serialized order event as a LIST entry under `orders:{client_order_id}`.
+    /// Updates the following indexes:
+    /// - `index:orders` (SET) — global order ID registry
+    /// - `index:orders_emulated` (SET) — conditional on emulation trigger
+    /// - `index:order_position` (HASH) — conditional on position_id
+    /// - `index:order_client` (HASH) — conditional on client_id
     fn add_order(&self, order: &OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
-        todo!()
+        let client_order_id = order.client_order_id();
+        let client_order_id_str = client_order_id.to_string();
+
+        log::debug!("Adding order: {client_order_id} to Redis");
+
+        // Store order event (RPUSH to list)
+        let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
+        let event = order.last_event();
+        let payload = DatabaseQueries::serialize_payload(self.encoding, event)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_order command: {e}"))?;
+
+        // Index: add to global order set (SADD)
+        let client_order_id_bytes = Bytes::from(client_order_id_str);
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            INDEX_ORDERS.to_string(),
+            Some(vec![client_order_id_bytes.clone()]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send order index command: {e}"))?;
+
+        // Index: emulated orders (SADD, conditional)
+        if let Some(trigger) = order.emulation_trigger()
+            && trigger != TriggerType::NoTrigger
+        {
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Insert,
+                INDEX_ORDERS_EMULATED.to_string(),
+                Some(vec![client_order_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send emulated index command: {e}"))?;
+        }
+
+        // Index: order-to-position mapping (HSET, conditional)
+        if let Some(position_id) = order.position_id() {
+            self.index_order_position(client_order_id, position_id)?;
+        }
+
+        // Index: order-to-client mapping (HSET, conditional)
+        if let Some(cid) = client_id {
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Insert,
+                INDEX_ORDER_CLIENT.to_string(),
+                Some(vec![
+                    client_order_id_bytes,
+                    Bytes::from(cid.to_string()),
+                ]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| anyhow::anyhow!("Failed to send order-client index command: {e}"))?;
+        }
+
+        Ok(())
     }
 
     fn add_order_snapshot(&self, snapshot: &OrderSnapshot) -> anyhow::Result<()> {
