@@ -1220,12 +1220,30 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         Ok(())
     }
 
+    /// Deletes an account event from Redis.
+    ///
+    /// Delegates to the public `delete_account_event` method which is
+    /// currently a no-op (pending redesign of account event storage).
     fn delete_account_event(&self, account_id: &AccountId, event_id: &str) -> anyhow::Result<()> {
-        todo!()
+        self.database.delete_account_event(account_id, event_id)
     }
 
+    /// Persists a generic key-value pair to Redis.
+    ///
+    /// Stores as a STRING value under key `general:{key}`.
+    /// The value is pre-serialized bytes and passed through directly.
     fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
-        todo!()
+        let key = format!("{GENERAL}{REDIS_DELIMITER}{key}");
+        log::debug!("Adding general key: {key} to Redis");
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![value]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add command: {e}"))
     }
 
     /// Persists a currency definition to Redis.
@@ -1285,8 +1303,28 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to send add_synthetic command: {e}"))
     }
 
+    /// Persists an account state event to Redis.
+    ///
+    /// Stores the last `AccountState` event as a LIST entry under key
+    /// `accounts:{account_id}`. Uses RPUSH to append the event to the list,
+    /// preserving the full event history for the account.
     fn add_account(&self, account: &AccountAny) -> anyhow::Result<()> {
-        todo!()
+        let account_id = account.id();
+        let key = format!("{ACCOUNTS}{REDIS_DELIMITER}{account_id}");
+        log::debug!("Adding account: {account_id} to Redis");
+        let last_event = account
+            .last_event()
+            .expect("account should have at least one event");
+        let payload = DatabaseQueries::serialize_payload(self.encoding, &last_event)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_account command: {e}"))
     }
 
     fn add_order(&self, order: &OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
@@ -1374,20 +1412,50 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         anyhow::bail!("Loading position snapshots from Redis cache adapter not supported")
     }
 
+    /// Indexes a venue order ID against a client order ID in Redis.
+    ///
+    /// Stores in a HASH at key `index:order_ids` where the field is the
+    /// client order ID and the value is the venue order ID. This allows
+    /// efficient lookup of venue-assigned order IDs from internal ones.
     fn index_venue_order_id(
         &self,
         client_order_id: ClientOrderId,
         venue_order_id: VenueOrderId,
     ) -> anyhow::Result<()> {
-        todo!()
+        let key = INDEX_ORDER_IDS.to_string();
+        log::debug!("Indexing venue order ID: {venue_order_id} for client order: {client_order_id}");
+        let payload = vec![
+            Bytes::from(client_order_id.to_string()),
+            Bytes::from(venue_order_id.to_string()),
+        ];
+        let op = DatabaseCommand::new(DatabaseOperation::Insert, key, Some(payload));
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send index_venue_order_id command: {e}"))
     }
 
+    /// Indexes an order-to-position mapping in Redis.
+    ///
+    /// Stores in a HASH at key `index:order_position` where the field is
+    /// the client order ID and the value is the position ID. This allows
+    /// efficient lookup of which position a given order belongs to.
     fn index_order_position(
         &self,
         client_order_id: ClientOrderId,
         position_id: PositionId,
     ) -> anyhow::Result<()> {
-        todo!()
+        let key = INDEX_ORDER_POSITION.to_string();
+        log::debug!("Indexing order position: {position_id} for client order: {client_order_id}");
+        let payload = vec![
+            Bytes::from(client_order_id.to_string()),
+            Bytes::from(position_id.to_string()),
+        ];
+        let op = DatabaseCommand::new(DatabaseOperation::Insert, key, Some(payload));
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send index_order_position command: {e}"))
     }
 
     fn update_actor(&self) -> anyhow::Result<()> {
@@ -1398,8 +1466,28 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         todo!()
     }
 
+    /// Updates an account state in Redis by appending the latest event.
+    ///
+    /// Stores the last `AccountState` event under key `accounts:{account_id}`.
+    /// Uses the Update operation which routes to RPUSH_EXISTS, meaning
+    /// the append only succeeds if the key already exists in Redis.
     fn update_account(&self, account: &AccountAny) -> anyhow::Result<()> {
-        todo!()
+        let account_id = account.id();
+        let key = format!("{ACCOUNTS}{REDIS_DELIMITER}{account_id}");
+        log::debug!("Updating account: {account_id} in Redis");
+        let last_event = account
+            .last_event()
+            .expect("account should have at least one event");
+        let payload = DatabaseQueries::serialize_payload(self.encoding, &last_event)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Update,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send update_account command: {e}"))
     }
 
     fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()> {
