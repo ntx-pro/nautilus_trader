@@ -969,15 +969,12 @@ fn get_collection_key(key: &str) -> anyhow::Result<&str> {
         })
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct RedisCacheDatabaseAdapter {
     pub encoding: SerializationEncoding,
     pub database: RedisCacheDatabase,
 }
 
-#[allow(dead_code)]
-#[allow(unused)]
 #[async_trait::async_trait]
 impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     fn close(&mut self) -> anyhow::Result<()> {
@@ -1278,85 +1275,13 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
-        let order_id_bytes = Bytes::from(client_order_id.to_string());
-
         log::debug!("Deleting order: {client_order_id} from Redis");
-        log::debug!("Trader key: {}", self.database.trader_key);
-
-        // Delete the order itself
-        let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
-        log::debug!("Deleting order key: {key}");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
-        self.database
-            .tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("Failed to send delete order command: {e}"))?;
-
-        // Delete from all order indexes
-        let index_keys = [
-            INDEX_ORDER_IDS,
-            INDEX_ORDERS,
-            INDEX_ORDERS_OPEN,
-            INDEX_ORDERS_CLOSED,
-            INDEX_ORDERS_EMULATED,
-            INDEX_ORDERS_INFLIGHT,
-        ];
-
-        for index_key in &index_keys {
-            let key = (*index_key).to_string();
-            log::debug!("Deleting from index: {key} (order_id: {client_order_id})");
-            let payload = vec![order_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.database
-                .tx
-                .send(op)
-                .map_err(|e| anyhow::anyhow!("Failed to send delete order index command: {e}"))?;
-        }
-
-        // Delete from hash indexes
-        let hash_indexes = [INDEX_ORDER_POSITION, INDEX_ORDER_CLIENT];
-        for index_key in &hash_indexes {
-            let key = (*index_key).to_string();
-            log::debug!("Deleting from hash index: {key} (order_id: {client_order_id})");
-            let payload = vec![order_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.database.tx.send(op).map_err(|e| {
-                anyhow::anyhow!("Failed to send delete order hash index command: {e}")
-            })?;
-        }
-
-        log::debug!("Sent all delete commands for order: {client_order_id}");
-        Ok(())
+        self.database.delete_order(client_order_id)
     }
 
     fn delete_position(&self, position_id: &PositionId) -> anyhow::Result<()> {
-        let position_id_bytes = Bytes::from(position_id.to_string());
-
-        // Delete the position itself
-        let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
-        self.database
-            .tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("Failed to send delete position command: {e}"))?;
-
-        // Delete from all position indexes
-        let index_keys = [
-            INDEX_POSITIONS,
-            INDEX_POSITIONS_OPEN,
-            INDEX_POSITIONS_CLOSED,
-        ];
-
-        for index_key in &index_keys {
-            let key = (*index_key).to_string();
-            let payload = vec![position_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.database.tx.send(op).map_err(|e| {
-                anyhow::anyhow!("Failed to send delete position index command: {e}")
-            })?;
-        }
-
-        Ok(())
+        log::debug!("Deleting position: {position_id} from Redis");
+        self.database.delete_position(position_id)
     }
 
     /// Deletes an account event from Redis.
@@ -1453,7 +1378,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         log::debug!("Adding account: {account_id} to Redis");
         let last_event = account
             .last_event()
-            .expect("account should have at least one event");
+            .ok_or_else(|| anyhow::anyhow!("Account {account_id} has no events"))?;
         let payload = DatabaseQueries::serialize_payload(self.encoding, &last_event)?;
         let op = DatabaseCommand::new(
             DatabaseOperation::Insert,
@@ -1597,7 +1522,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         // Store position's last event (initial fill)
         let event = position
             .last_event()
-            .expect("position should have at least one event");
+            .ok_or_else(|| anyhow::anyhow!("Position {position_id} has no events"))?;
         let payload = DatabaseQueries::serialize_payload(self.encoding, &event)?;
         let op = DatabaseCommand::new(
             DatabaseOperation::Insert,
@@ -2008,18 +1933,84 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .collect()
     }
 
+    /// Loads the most recent order snapshot from Redis.
+    ///
+    /// Reads the last element (LRANGE -1 -1) from the LIST at key
+    /// `snapshots:orders:{client_order_id}` and deserializes it.
+    /// Returns `Ok(None)` when no snapshots exist for this order.
     fn load_order_snapshot(
         &self,
         client_order_id: &ClientOrderId,
     ) -> anyhow::Result<Option<OrderSnapshot>> {
-        anyhow::bail!("Loading order snapshots from Redis cache adapter not supported")
+        let key = format!(
+            "{}{REDIS_DELIMITER}{SNAPSHOTS}{REDIS_DELIMITER}{ORDERS}{REDIS_DELIMITER}{client_order_id}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<Vec<u8>>, _> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(-1i64)
+                .arg(-1i64)
+                .query_async(&mut con)
+                .await;
+            let _ = tx.send(result);
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        match items.first() {
+            Some(raw) => {
+                let snapshot: OrderSnapshot =
+                    DatabaseQueries::deserialize_payload(self.encoding, raw)?;
+                Ok(Some(snapshot))
+            }
+            None => Ok(None),
+        }
     }
 
+    /// Loads the most recent position snapshot from Redis.
+    ///
+    /// Reads the last element (LRANGE -1 -1) from the LIST at key
+    /// `snapshots:positions:{position_id}` and deserializes it.
+    /// Returns `Ok(None)` when no snapshots exist for this position.
     fn load_position_snapshot(
         &self,
         position_id: &PositionId,
     ) -> anyhow::Result<Option<PositionSnapshot>> {
-        anyhow::bail!("Loading position snapshots from Redis cache adapter not supported")
+        let key = format!(
+            "{}{REDIS_DELIMITER}{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<Vec<u8>>, _> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(-1i64)
+                .arg(-1i64)
+                .query_async(&mut con)
+                .await;
+            let _ = tx.send(result);
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        match items.first() {
+            Some(raw) => {
+                let snapshot: PositionSnapshot =
+                    DatabaseQueries::deserialize_payload(self.encoding, raw)?;
+                Ok(Some(snapshot))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Indexes a venue order ID against a client order ID in Redis.
@@ -2096,7 +2087,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         log::debug!("Updating account: {account_id} in Redis");
         let last_event = account
             .last_event()
-            .expect("account should have at least one event");
+            .ok_or_else(|| anyhow::anyhow!("Account {account_id} has no events"))?;
         let payload = DatabaseQueries::serialize_payload(self.encoding, &last_event)?;
         let op = DatabaseCommand::new(
             DatabaseOperation::Update,
@@ -2126,11 +2117,24 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     /// - Open: Accepted, Triggered, PendingCancel, PendingUpdate
     /// - Closed: Denied, Rejected, Canceled, Expired, Filled
     ///
-    /// Note: `Filled` events are treated as closed. The `OrderFilled` struct
-    /// does not carry `leaves_qty`, so we cannot distinguish partial fills
-    /// from full fills. The in-memory cache (which has the full `Order`) is
-    /// the source of truth at runtime. On recovery, events are replayed and
-    /// order state is reconstructed correctly.
+    /// # Partial fill limitation
+    ///
+    /// `OrderEventAny::Filled` is used for both partial and full fills.
+    /// The `OrderFilled` struct does not carry `leaves_qty`, so we cannot
+    /// distinguish partial fills from full fills at the event level. All
+    /// `Filled` events are treated as closed, which causes incorrect index
+    /// state for partially filled orders (they will appear in
+    /// `index:orders_closed` while still being active).
+    ///
+    /// This is acceptable because:
+    /// - The in-memory cache (which has the full `Order` with `is_open()`
+    ///   / `is_closed()`) remains the runtime source of truth.
+    /// - On recovery, events are replayed in order and the final order
+    ///   state is reconstructed correctly from the event sequence.
+    ///
+    /// Proposed enhancement: change the trait to pass `&OrderAny` instead
+    /// of `&OrderEventAny`, enabling `order.is_open()` / `order.is_closed()`
+    /// for accurate index management.
     fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()> {
         let client_order_id = order_event.client_order_id();
         let client_order_id_bytes = Bytes::from(client_order_id.to_string());
@@ -2284,7 +2288,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
         let event = position
             .last_event()
-            .expect("position should have at least one event");
+            .ok_or_else(|| anyhow::anyhow!("Position {position_id} has no events"))?;
         let payload = DatabaseQueries::serialize_payload(self.encoding, &event)?;
         let op = DatabaseCommand::new(
             DatabaseOperation::Update,
