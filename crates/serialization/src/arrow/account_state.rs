@@ -70,10 +70,12 @@ impl EncodeToRecordBatch for AccountState {
                 None => base_currency_builder.append_null(),
             }
 
-            let balances_json = serde_json::to_string(&event.balances).unwrap_or_default();
+            let balances_json = serde_json::to_string(&event.balances)
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
             balances_builder.append_value(&balances_json);
 
-            let margins_json = serde_json::to_string(&event.margins).unwrap_or_default();
+            let margins_json = serde_json::to_string(&event.margins)
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
             margins_builder.append_value(&margins_json);
 
             is_reported_builder.append_value(event.is_reported);

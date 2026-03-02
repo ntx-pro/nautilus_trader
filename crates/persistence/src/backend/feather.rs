@@ -673,7 +673,7 @@ impl FeatherWriter {
                 if let Err(e) = runtime.block_on(writer.write_instrument(instrument.clone())) {
                     log::warn!("Failed to write InstrumentAny: {e}");
                 }
-            // Execution events (D-009: 100% data capture)
+            // Execution events
             } else if let Some(event) = message.downcast_ref::<OrderFilled>() {
                 let mut writer = writer.borrow_mut();
                 if let Err(e) = runtime.block_on(writer.write(*event)) {
