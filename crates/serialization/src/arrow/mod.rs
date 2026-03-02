@@ -22,6 +22,7 @@ pub mod depth;
 pub mod index_price;
 pub mod instrument;
 pub mod mark_price;
+pub mod order_filled;
 pub mod quote;
 pub mod trade;
 
