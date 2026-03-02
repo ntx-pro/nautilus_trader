@@ -1411,8 +1411,69 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         todo!()
     }
 
+    /// Persists a position's initial fill event and updates position indexes.
+    ///
+    /// Uses the DELETE-first pattern for NETTING mode compatibility: in NETTING
+    /// mode, the same position ID is reused when a position flips direction
+    /// (e.g., long to short). Deleting the existing key before inserting
+    /// prevents appending to a stale event list.
+    ///
+    /// Operations:
+    /// 1. DELETE existing position key (handles NETTING mode flip)
+    /// 2. RPUSH the position's last event (initial fill)
+    /// 3. SADD to `index:positions` (global position set)
+    /// 4. SADD to `index:positions_open` (new positions start as open)
     fn add_position(&self, position: &Position) -> anyhow::Result<()> {
-        todo!()
+        let position_id = position.id;
+        let position_id_str = position_id.to_string();
+        let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
+
+        log::debug!("Adding position: {position_id} to Redis");
+
+        // Delete existing data first (NETTING mode: same ID reused on flip)
+        let op = DatabaseCommand::new(DatabaseOperation::Delete, key.clone(), None);
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send delete position command: {e}"))?;
+
+        // Store position's last event (initial fill)
+        let event = position
+            .last_event()
+            .expect("position should have at least one event");
+        let payload = DatabaseQueries::serialize_payload(self.encoding, &event)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_position command: {e}"))?;
+
+        // Index: add to global position set (SADD)
+        let position_id_bytes = Bytes::from(position_id_str);
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            INDEX_POSITIONS.to_string(),
+            Some(vec![position_id_bytes.clone()]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send position index command: {e}"))?;
+
+        // Index: add to open positions (SADD)
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            INDEX_POSITIONS_OPEN.to_string(),
+            Some(vec![position_id_bytes]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send position open index command: {e}"))
     }
 
     fn add_position_snapshot(&self, snapshot: &PositionSnapshot) -> anyhow::Result<()> {
@@ -1721,8 +1782,88 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         Ok(())
     }
 
+    /// Appends a fill event to a position and updates open/closed indexes.
+    ///
+    /// Called on every position state change (new fill). Performs:
+    /// 1. RPUSH_EXISTS the position's last event (append fill to event list)
+    /// 2. Manages open/closed indexes (mutually exclusive transition)
+    ///
+    /// Open and closed are exclusive states: when a position transitions to
+    /// closed (flat), it is removed from `index:positions_open` and added to
+    /// `index:positions_closed`, and vice versa.
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
-        todo!()
+        let position_id = position.id;
+        let position_id_str = position_id.to_string();
+        let position_id_bytes = Bytes::from(position_id_str);
+
+        log::debug!("Updating position: {position_id} in Redis");
+
+        // Append fill event to position list (RPUSH_EXISTS)
+        let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
+        let event = position
+            .last_event()
+            .expect("position should have at least one event");
+        let payload = DatabaseQueries::serialize_payload(self.encoding, &event)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Update,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send update_position command: {e}"))?;
+
+        // Index: open/closed state (mutually exclusive)
+        if position.is_open() {
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Insert,
+                INDEX_POSITIONS_OPEN.to_string(),
+                Some(vec![position_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send position open index command: {e}")
+                })?;
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Delete,
+                INDEX_POSITIONS_CLOSED.to_string(),
+                Some(vec![position_id_bytes]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send position closed index remove command: {e}")
+                })?;
+        } else if position.is_closed() {
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Insert,
+                INDEX_POSITIONS_CLOSED.to_string(),
+                Some(vec![position_id_bytes.clone()]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send position closed index command: {e}")
+                })?;
+            let op = DatabaseCommand::new(
+                DatabaseOperation::Delete,
+                INDEX_POSITIONS_OPEN.to_string(),
+                Some(vec![position_id_bytes]),
+            );
+            self.database
+                .tx
+                .send(op)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send position open index remove command: {e}")
+                })?;
+        }
+
+        Ok(())
     }
 
     fn snapshot_order_state(&self, order: &OrderAny) -> anyhow::Result<()> {
