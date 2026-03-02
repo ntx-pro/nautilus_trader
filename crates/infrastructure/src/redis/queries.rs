@@ -22,6 +22,7 @@ use futures::future::join_all;
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
+    events::order::any::OrderEventAny,
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::OrderAny,
@@ -715,11 +716,20 @@ impl DatabaseQueries {
         Ok(Some(account))
     }
 
-    /// Loads a single order for `trader_key` and `client_order_id` using the specified `encoding`.
+    /// Loads an order by replaying all persisted events from the Redis list.
+    ///
+    /// The order's Redis list contains serialized [`OrderEventAny`] entries
+    /// stored by [`add_order`] and [`update_order`]:
+    /// - `result[0]` is always `OrderInitialized`
+    /// - `result[1..]` are subsequent events (Submitted, Accepted, Filled, etc.)
+    ///
+    /// Reconstructs the full order state via [`OrderAny::from_events()`].
+    /// Falls back to direct deserialization for backward compatibility with
+    /// data that may have been written in a different format.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying read or deserialization fails.
+    /// Returns an error if both event replay and fallback deserialization fail.
     pub async fn load_order(
         con: &ConnectionManager,
         trader_key: &str,
@@ -732,8 +742,38 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let order: OrderAny = Self::deserialize_payload(encoding, &result[0])?;
-        Ok(Some(order))
+        // Try event replay first: deserialize each list entry as an OrderEventAny
+        let events_result: anyhow::Result<Vec<OrderEventAny>> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect();
+
+        match events_result {
+            Ok(events) if !events.is_empty() => {
+                match OrderAny::from_events(events) {
+                    Ok(order) => Ok(Some(order)),
+                    Err(e) => {
+                        log::warn!(
+                            "Event replay failed for {client_order_id}, \
+                             trying direct deserialization: {e}"
+                        );
+                        let order: OrderAny =
+                            Self::deserialize_payload(encoding, &result[0])?;
+                        Ok(Some(order))
+                    }
+                }
+            }
+            Err(_) => {
+                // Fallback: deserialize as full OrderAny (legacy format)
+                log::debug!(
+                    "Deserializing order {client_order_id} from legacy format"
+                );
+                let order: OrderAny =
+                    Self::deserialize_payload(encoding, &result[0])?;
+                Ok(Some(order))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Loads a single position for `trader_key` and `position_id` using the specified `encoding`.
