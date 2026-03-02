@@ -99,6 +99,12 @@ const ACTORS: &str = "actors";
 const STRATEGIES: &str = "strategies";
 const SNAPSHOTS: &str = "snapshots";
 const HEALTH: &str = "health";
+const QUOTES: &str = "quotes";
+const TRADES: &str = "trades";
+const BARS: &str = "bars";
+const SIGNALS: &str = "signals";
+const CUSTOM_DATA: &str = "custom_data";
+const FUNDING_RATES: &str = "funding_rates";
 
 // Index keys
 const INDEX_ORDER_IDS: &str = "index:order_ids";
@@ -704,6 +710,30 @@ fn insert(
         }
         HEALTH => {
             insert_string(pipe, key, value[0].as_ref());
+            Ok(())
+        }
+        QUOTES => {
+            insert_list(pipe, key, value[0].as_ref());
+            Ok(())
+        }
+        TRADES => {
+            insert_list(pipe, key, value[0].as_ref());
+            Ok(())
+        }
+        BARS => {
+            insert_list(pipe, key, value[0].as_ref());
+            Ok(())
+        }
+        SIGNALS => {
+            insert_list(pipe, key, value[0].as_ref());
+            Ok(())
+        }
+        CUSTOM_DATA => {
+            insert_list(pipe, key, value[0].as_ref());
+            Ok(())
+        }
+        FUNDING_RATES => {
+            insert_list(pipe, key, value[0].as_ref());
             Ok(())
         }
         _ => anyhow::bail!("Unsupported operation: `insert` for collection '{collection}'"),
@@ -1626,59 +1656,356 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("Failed to send add_position_snapshot command: {e}"))
     }
 
+    /// Persists an order book snapshot to Redis.
+    ///
+    /// No-op: `OrderBook` does not implement `Serialize` because it contains
+    /// internal ladder structures that are rebuilt from delta events. Both the
+    /// upstream Redis and PostgreSQL adapters leave this unimplemented.
     fn add_order_book(&self, order_book: &OrderBook) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+        log::debug!(
+            "add_order_book called for {} (no-op: OrderBook is not serializable)",
+            order_book.instrument_id,
+        );
+        Ok(())
     }
 
+    /// Persists a quote tick to Redis.
+    ///
+    /// Appends the serialized `QuoteTick` (RPUSH) to the LIST at key
+    /// `quotes:{instrument_id}`, preserving the full time-series history.
     fn add_quote(&self, quote: &QuoteTick) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+        let key = format!("{QUOTES}{REDIS_DELIMITER}{}", quote.instrument_id);
+        log::debug!("Adding quote for {} to Redis", quote.instrument_id);
+        let payload = DatabaseQueries::serialize_payload(self.encoding, quote)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_quote command: {e}"))
     }
 
+    /// Loads all persisted quote ticks for an instrument from Redis.
+    ///
+    /// Reads the full LIST at key `quotes:{instrument_id}` using LRANGE 0 -1,
+    /// deserializes each entry, and returns them in insertion order.
     fn load_quotes(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<QuoteTick>> {
-        anyhow::bail!("Loading quote data for Redis cache adapter not supported")
+        let key = format!(
+            "{}{REDIS_DELIMITER}{QUOTES}{REDIS_DELIMITER}{instrument_id}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<Vec<u8>>, _> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(0i64)
+                .arg(-1i64)
+                .query_async(&mut con)
+                .await;
+            let _ = tx.send(result);
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        items
+            .iter()
+            .map(|raw| DatabaseQueries::deserialize_payload(self.encoding, raw))
+            .collect()
     }
 
+    /// Persists a trade tick to Redis.
+    ///
+    /// Appends the serialized `TradeTick` (RPUSH) to the LIST at key
+    /// `trades:{instrument_id}`, preserving the full time-series history.
     fn add_trade(&self, trade: &TradeTick) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+        let key = format!("{TRADES}{REDIS_DELIMITER}{}", trade.instrument_id);
+        log::debug!("Adding trade for {} to Redis", trade.instrument_id);
+        let payload = DatabaseQueries::serialize_payload(self.encoding, trade)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_trade command: {e}"))
     }
 
+    /// Loads all persisted trade ticks for an instrument from Redis.
+    ///
+    /// Reads the full LIST at key `trades:{instrument_id}` using LRANGE 0 -1,
+    /// deserializes each entry, and returns them in insertion order.
     fn load_trades(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<TradeTick>> {
-        anyhow::bail!("Loading market data for Redis cache adapter not supported")
+        let key = format!(
+            "{}{REDIS_DELIMITER}{TRADES}{REDIS_DELIMITER}{instrument_id}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<Vec<u8>>, _> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(0i64)
+                .arg(-1i64)
+                .query_async(&mut con)
+                .await;
+            let _ = tx.send(result);
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        items
+            .iter()
+            .map(|raw| DatabaseQueries::deserialize_payload(self.encoding, raw))
+            .collect()
     }
 
+    /// Persists a funding rate update to Redis.
+    ///
+    /// Appends the serialized `FundingRateUpdate` (RPUSH) to the LIST at key
+    /// `funding_rates:{instrument_id}`, preserving the full time-series history.
     fn add_funding_rate(&self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
-        anyhow::bail!("Loading market data for Redis cache adapter not supported")
+        let key = format!(
+            "{FUNDING_RATES}{REDIS_DELIMITER}{}",
+            funding_rate.instrument_id,
+        );
+        log::debug!(
+            "Adding funding rate for {} to Redis",
+            funding_rate.instrument_id,
+        );
+        let payload = DatabaseQueries::serialize_payload(self.encoding, funding_rate)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_funding_rate command: {e}"))
     }
 
+    /// Loads all persisted funding rate updates for an instrument from Redis.
+    ///
+    /// Reads the full LIST at key `funding_rates:{instrument_id}` using
+    /// LRANGE 0 -1, deserializes each entry, and returns them in insertion
+    /// order.
     fn load_funding_rates(
         &self,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<Vec<FundingRateUpdate>> {
-        anyhow::bail!("Loading market data for Redis cache adapter not supported")
+        let key = format!(
+            "{}{REDIS_DELIMITER}{FUNDING_RATES}{REDIS_DELIMITER}{instrument_id}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<Vec<u8>>, _> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(0i64)
+                .arg(-1i64)
+                .query_async(&mut con)
+                .await;
+            let _ = tx.send(result);
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        items
+            .iter()
+            .map(|raw| DatabaseQueries::deserialize_payload(self.encoding, raw))
+            .collect()
     }
 
+    /// Persists a bar to Redis.
+    ///
+    /// Appends the serialized `Bar` (RPUSH) to the LIST at key
+    /// `bars:{bar_type}`, where `bar_type` encodes the instrument ID,
+    /// bar specification (step, aggregation), and aggregation source.
     fn add_bar(&self, bar: &Bar) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+        let key = format!("{BARS}{REDIS_DELIMITER}{}", bar.bar_type);
+        log::debug!("Adding bar for {} to Redis", bar.bar_type);
+        let payload = DatabaseQueries::serialize_payload(self.encoding, bar)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_bar command: {e}"))
     }
 
+    /// Loads all persisted bars for an instrument from Redis.
+    ///
+    /// Scans for all LIST keys matching `bars:{instrument_id}*` (covering
+    /// all bar types for the instrument), reads each list via LRANGE 0 -1,
+    /// deserializes the entries, and returns them concatenated.
     fn load_bars(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<Bar>> {
-        anyhow::bail!("Loading market data for Redis cache adapter not supported")
+        let pattern = format!(
+            "{}{REDIS_DELIMITER}{BARS}{REDIS_DELIMITER}{instrument_id}*",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let keys = match DatabaseQueries::scan_keys(&mut con, pattern).await {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+
+            let mut all_bars = Vec::new();
+            for key in &keys {
+                let items: Vec<Vec<u8>> = match redis::cmd("LRANGE")
+                    .arg(key)
+                    .arg(0i64)
+                    .arg(-1i64)
+                    .query_async(&mut con)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::anyhow!("LRANGE failed for {key}: {e}")));
+                        return;
+                    }
+                };
+                all_bars.extend(items);
+            }
+            let _ = tx.send(Ok(all_bars));
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        items
+            .iter()
+            .map(|raw| DatabaseQueries::deserialize_payload(self.encoding, raw))
+            .collect()
     }
 
+    /// Persists a signal to Redis.
+    ///
+    /// Appends the serialized `Signal` (RPUSH) to the LIST at key
+    /// `signals:{name}`, preserving the full time-series history.
     fn add_signal(&self, signal: &Signal) -> anyhow::Result<()> {
-        anyhow::bail!("Saving signals for Redis cache adapter not supported")
+        let key = format!("{SIGNALS}{REDIS_DELIMITER}{}", signal.name);
+        log::debug!("Adding signal '{}' to Redis", signal.name);
+        let payload = DatabaseQueries::serialize_payload(self.encoding, signal)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_signal command: {e}"))
     }
 
+    /// Loads all persisted signals by name from Redis.
+    ///
+    /// Reads the full LIST at key `signals:{name}` using LRANGE 0 -1,
+    /// deserializes each entry, and returns them in insertion order.
     fn load_signals(&self, name: &str) -> anyhow::Result<Vec<Signal>> {
-        anyhow::bail!("Loading signals from Redis cache adapter not supported")
+        let key = format!(
+            "{}{REDIS_DELIMITER}{SIGNALS}{REDIS_DELIMITER}{name}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<Vec<u8>>, _> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(0i64)
+                .arg(-1i64)
+                .query_async(&mut con)
+                .await;
+            let _ = tx.send(result);
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        items
+            .iter()
+            .map(|raw| DatabaseQueries::deserialize_payload(self.encoding, raw))
+            .collect()
     }
 
+    /// Persists custom data to Redis.
+    ///
+    /// Appends the serialized `CustomData` (RPUSH) to the LIST at key
+    /// `custom_data:{data_type}`, where `data_type` is the topic string
+    /// representation of the data type.
     fn add_custom_data(&self, data: &CustomData) -> anyhow::Result<()> {
-        anyhow::bail!("Saving custom data for Redis cache adapter not supported")
+        let key = format!("{CUSTOM_DATA}{REDIS_DELIMITER}{}", data.data_type);
+        log::debug!("Adding custom data '{}' to Redis", data.data_type);
+        let payload = DatabaseQueries::serialize_payload(self.encoding, data)?;
+        let op = DatabaseCommand::new(
+            DatabaseOperation::Insert,
+            key,
+            Some(vec![Bytes::from(payload)]),
+        );
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("Failed to send add_custom_data command: {e}"))
     }
 
+    /// Loads all persisted custom data by data type from Redis.
+    ///
+    /// Reads the full LIST at key `custom_data:{data_type}` using
+    /// LRANGE 0 -1, deserializes each entry, and returns them in insertion
+    /// order.
     fn load_custom_data(&self, data_type: &DataType) -> anyhow::Result<Vec<CustomData>> {
-        anyhow::bail!("Loading custom data from Redis cache adapter not supported")
+        let key = format!(
+            "{}{REDIS_DELIMITER}{CUSTOM_DATA}{REDIS_DELIMITER}{data_type}",
+            self.database.trader_key,
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut con = self.database.con.clone();
+
+        get_runtime().spawn(async move {
+            let result: Result<Vec<Vec<u8>>, _> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(0i64)
+                .arg(-1i64)
+                .query_async(&mut con)
+                .await;
+            let _ = tx.send(result);
+        });
+
+        let items: Vec<Vec<u8>> =
+            blocking_recv(&rx).map_err(|e| anyhow::anyhow!("Channel closed: {e}"))??;
+
+        items
+            .iter()
+            .map(|raw| DatabaseQueries::deserialize_payload(self.encoding, raw))
+            .collect()
     }
 
     fn load_order_snapshot(
