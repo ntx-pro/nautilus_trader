@@ -22,7 +22,7 @@ use futures::future::join_all;
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
-    events::order::any::OrderEventAny,
+    events::{AccountState, order::any::OrderEventAny},
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::OrderAny,
@@ -700,6 +700,15 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if the underlying read or deserialization fails.
+    /// Loads an account by replaying all persisted events from the Redis list.
+    ///
+    /// The account's Redis list contains serialized [`AccountState`] entries
+    /// stored by [`add_account`] and [`update_account`]:
+    /// - `result[0]` is the initial account state
+    /// - `result[1..]` are subsequent state updates
+    ///
+    /// Reconstructs the full account via [`AccountAny::from_events()`].
+    /// Falls back to direct deserialization for backward compatibility.
     pub async fn load_account(
         con: &ConnectionManager,
         trader_key: &str,
@@ -712,8 +721,36 @@ impl DatabaseQueries {
             return Ok(None);
         }
 
-        let account: AccountAny = Self::deserialize_payload(encoding, &result[0])?;
-        Ok(Some(account))
+        // Try event replay first (current write format)
+        let events_result: anyhow::Result<Vec<AccountState>> = result
+            .iter()
+            .map(|bytes| Self::deserialize_payload(encoding, bytes))
+            .collect();
+
+        match events_result {
+            Ok(events) if !events.is_empty() => {
+                match AccountAny::from_events(events) {
+                    Ok(account) => Ok(Some(account)),
+                    Err(e) => {
+                        log::warn!(
+                            "Account event replay failed for {account_id}, \
+                             trying direct deserialization: {e}"
+                        );
+                        let account: AccountAny =
+                            Self::deserialize_payload(encoding, &result[0])?;
+                        Ok(Some(account))
+                    }
+                }
+            }
+            Err(_) => {
+                // Fallback: deserialize as full AccountAny (legacy format)
+                log::debug!("Deserializing account {account_id} from legacy format");
+                let account: AccountAny =
+                    Self::deserialize_payload(encoding, &result[0])?;
+                Ok(Some(account))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Loads an order by replaying all persisted events from the Redis list.
