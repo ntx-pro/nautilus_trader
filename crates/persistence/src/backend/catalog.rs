@@ -3270,6 +3270,11 @@ impl_catalog_path_prefix!(nautilus_model::events::order::filled::OrderFilled, "o
 impl_catalog_path_prefix!(nautilus_model::events::order::accepted::OrderAccepted, "order_accepts");
 impl_catalog_path_prefix!(nautilus_model::events::order::canceled::OrderCanceled, "order_cancels");
 impl_catalog_path_prefix!(nautilus_model::events::order::rejected::OrderRejected, "order_rejects");
+impl_catalog_path_prefix!(nautilus_model::events::account::state::AccountState, "account_states");
+impl_catalog_path_prefix!(nautilus_model::data::funding::FundingRateUpdate, "funding_rates");
+impl_catalog_path_prefix!(nautilus_model::events::position::opened::PositionOpened, "position_opens");
+impl_catalog_path_prefix!(nautilus_model::events::position::changed::PositionChanged, "position_changes");
+impl_catalog_path_prefix!(nautilus_model::events::position::closed::PositionClosed, "position_closes");
 
 /// Converts timestamps to a filename using ISO 8601 format.
 ///
