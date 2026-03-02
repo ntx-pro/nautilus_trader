@@ -451,13 +451,13 @@ mod serial_tests {
         let submitted = TestOrderEventStubs::submitted(&market_order, account);
         market_order.apply(submitted).unwrap();
 
-        pg_cache.update_order(market_order.last_event()).unwrap();
+        pg_cache.update_order(&market_order).unwrap();
 
         let accepted =
             TestOrderEventStubs::accepted(&market_order, account, VenueOrderId::new("001"));
         market_order.apply(accepted).unwrap();
 
-        pg_cache.update_order(market_order.last_event()).unwrap();
+        pg_cache.update_order(&market_order).unwrap();
 
         let filled = TestOrderEventStubs::filled(
             &market_order,
@@ -473,7 +473,7 @@ mod serial_tests {
         );
         market_order.apply(filled).unwrap();
 
-        pg_cache.update_order(market_order.last_event()).unwrap();
+        pg_cache.update_order(&market_order).unwrap();
         wait_until_async(
             || async {
                 let result = pg_cache
