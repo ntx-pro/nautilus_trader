@@ -23,7 +23,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
-streaming = ["nautilus-persistence"]
+streaming = ["nautilus-persistence", "dep:tokio"]
 extension-module = ["python", "pyo3/extension-module", "streaming"]
 live = ["nautilus-common/live"]
 python = ["nautilus-core/python", "pyo3", "streaming"]
@@ -50,6 +50,7 @@ log = { workspace = true }
 sysinfo = { workspace = true }
 ustr = { workspace = true }
 
+tokio = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
