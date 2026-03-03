@@ -198,28 +198,6 @@ pub struct BinanceSpotAccountPosition {
     pub balances: Vec<BinanceSpotBalance>,
 }
 
-/// Balance update event from Binance Spot User Data Stream.
-///
-/// Emitted on deposits, withdrawals, and other balance-affecting operations.
-#[derive(Debug, Clone, Deserialize)]
-pub struct BinanceSpotBalanceUpdate {
-    /// Event type (always `"balanceUpdate"`).
-    #[serde(rename = "e")]
-    pub event_type: String,
-    /// Event time in milliseconds.
-    #[serde(rename = "E")]
-    pub event_time: i64,
-    /// Asset that changed.
-    #[serde(rename = "a")]
-    pub asset: String,
-    /// Balance delta.
-    #[serde(rename = "d")]
-    pub balance_delta: String,
-    /// Clear time in milliseconds.
-    #[serde(rename = "T")]
-    pub clear_time: i64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
