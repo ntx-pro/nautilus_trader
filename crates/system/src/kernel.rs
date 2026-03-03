@@ -299,6 +299,13 @@ impl NautilusKernel {
             instance_id,
         );
 
+        // Ensure the catalog directory exists for LocalFileSystem (requires canonical path).
+        // For S3/cloud backends this is a no-op (the directory is virtual).
+        if config.fs_protocol == "file" {
+            std::fs::create_dir_all(&catalog_path)
+                .map_err(|e| anyhow::anyhow!("failed to create streaming catalog directory '{catalog_path}': {e}"))?;
+        }
+
         let (store, base_path, _scheme) = create_object_store_from_path(&catalog_path, None)?;
 
         // Convert system RotationConfig to persistence RotationConfig.
