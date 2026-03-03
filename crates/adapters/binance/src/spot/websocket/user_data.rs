@@ -264,17 +264,40 @@ impl BinanceSpotUserDataStream {
                         break;
                     }
 
-                    // Re-subscribe to user data stream on the new connection
+                    // Re-subscribe with retry (3 attempts, 1s delay between retries)
                     request_id_counter += 1;
-                    if let Err(e) = Self::send_subscribe_msg(
-                        &ws_client,
-                        &credential,
-                        clock,
-                        request_id_counter,
-                    )
-                    .await
-                    {
-                        log::error!("Failed to re-subscribe after reconnect: {e}");
+                    let mut subscribed = false;
+                    for attempt in 1..=3u32 {
+                        match Self::send_subscribe_msg(
+                            &ws_client,
+                            &credential,
+                            clock,
+                            request_id_counter,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                subscribed = true;
+                                break;
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Re-subscribe attempt {attempt}/3 failed: {e}"
+                                );
+                                if attempt < 3 {
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_secs(1),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    if !subscribed {
+                        log::error!(
+                            "All re-subscribe attempts failed after reconnect. \
+                             UDS will not receive execution events until next reconnect."
+                        );
                     }
 
                     continue;
@@ -510,7 +533,7 @@ mod tests {
     fn dispatch_malformed_json_no_panic() {
         let (tx, mut rx) = test_channel();
 
-        let json = r#"this is not valid json"#;
+        let json = "this is not valid json";
 
         BinanceSpotUserDataStream::dispatch_json_message(json, &tx);
 

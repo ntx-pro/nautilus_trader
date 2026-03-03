@@ -45,7 +45,7 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::OmsType,
     events::{
-        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny,
+        AccountState, OrderAccepted, OrderCancelRejected, OrderEventAny,
         OrderModifyRejected, OrderRejected, OrderUpdated,
     },
     identifiers::{AccountId, ClientId, Venue, VenueOrderId},
@@ -285,22 +285,14 @@ impl BinanceSpotExecutionClient {
 
             match result {
                 Ok(venue_order_id) => {
-                    // Order canceled - dispatch OrderCanceled event
-                    let ts_now = clock.get_time_ns();
-                    let canceled_event = OrderCanceled::new(
-                        trader_id,
-                        command.strategy_id,
-                        command.instrument_id,
+                    // HTTP only logs success. OrderCanceled comes from UDS WebSocket
+                    // push event (executionReport with x=CANCELED). This follows the
+                    // Futures adapter pattern where HTTP cancel only emits rejection
+                    // on failure.
+                    log::debug!(
+                        "Cancel request accepted: client_order_id={}, venue_order_id={venue_order_id}",
                         command.client_order_id,
-                        UUID4::new(),
-                        ts_now,
-                        ts_now,
-                        false,
-                        Some(venue_order_id),
-                        Some(account_id),
                     );
-
-                    event_emitter.send_order_event(OrderEventAny::Canceled(canceled_event));
                 }
                 Err(e) => {
                     let ts_now = clock.get_time_ns();
@@ -495,25 +487,9 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             instruments
         };
 
-        // Request initial account state
-        let account_state = self
-            .refresh_account_state()
-            .await
-            .context("failed to request Binance account state")?;
-
-        if !account_state.balances.is_empty() {
-            log::info!(
-                "Received account state with {} balance(s)",
-                account_state.balances.len()
-            );
-        }
-
-        self.emitter.send_account_state(account_state);
-
-        // Wait for account to be registered in cache before completing connect
-        self.await_account_registered(30.0).await?;
-
-        // Set up User Data Stream WebSocket for real-time execution events
+        // Set up User Data Stream WebSocket BEFORE account state (Futures pattern).
+        // This ensures no fill events are missed between account state request and
+        // WS connection.
         self.handler_signal.store(false, Ordering::Relaxed);
 
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -561,17 +537,8 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         let handler_signal = self.handler_signal.clone();
 
         let uds_task = get_runtime().spawn(async move {
-            loop {
-                tokio::select! {
-                    msg = handler.next() => {
-                        match msg {
-                            Some(event) => {
-                                Self::handle_exec_event(event, &emitter);
-                            }
-                            None => break,
-                        }
-                    }
-                }
+            while let Some(event) = handler.next().await {
+                Self::handle_exec_event(event, &emitter);
             }
 
             if !handler_signal.load(Ordering::Relaxed) {
@@ -579,6 +546,26 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             }
         });
         *self.uds_task.lock().expect(MUTEX_POISONED) = Some(uds_task);
+
+        // Request initial account state AFTER WebSocket is connected, matching
+        // the Futures adapter pattern. This ensures fill events on pre-existing
+        // orders are captured by the handler.
+        let account_state = self
+            .refresh_account_state()
+            .await
+            .context("failed to request Binance account state")?;
+
+        if !account_state.balances.is_empty() {
+            log::info!(
+                "Received account state with {} balance(s)",
+                account_state.balances.len()
+            );
+        }
+
+        self.emitter.send_account_state(account_state);
+
+        // Wait for account to be registered in cache before completing connect
+        self.await_account_registered(30.0).await?;
 
         self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
@@ -590,21 +577,21 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
-        // Signal handler to stop
+        // Signal handler to stop and drop command channel (unblocks handler.next())
         self.handler_signal.store(true, Ordering::Relaxed);
-
-        // Disconnect UDS WebSocket
-        if let Some(ref mut uds_client) = self.uds_client {
-            uds_client.disconnect().await;
-        }
-        self.uds_client = None;
         self.exec_cmd_tx = None;
 
-        // Wait for handler task to complete
+        // Wait for handler task to process remaining events before closing WS
         let uds_task = self.uds_task.lock().expect(MUTEX_POISONED).take();
         if let Some(task) = uds_task {
             let _ = task.await;
         }
+
+        // Disconnect UDS WebSocket after handler has stopped
+        if let Some(ref mut uds_client) = self.uds_client {
+            uds_client.disconnect().await;
+        }
+        self.uds_client = None;
 
         self.abort_pending_tasks();
 
@@ -703,7 +690,16 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
+        // Signal handler to stop and drop command channel
         self.handler_signal.store(true, Ordering::Relaxed);
+        self.exec_cmd_tx = None;
+
+        // Abort UDS handler task
+        let uds_task = self.uds_task.lock().expect(MUTEX_POISONED).take();
+        if let Some(task) = uds_task {
+            task.abort();
+        }
+
         self.core.set_stopped();
         self.core.set_disconnected();
         self.abort_pending_tasks();
@@ -867,31 +863,16 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         let http_client = self.http_client.clone();
         let command = cmd.clone();
 
-        let event_emitter = self.emitter.clone();
-        let trader_id = self.core.trader_id;
-        let account_id = self.core.account_id;
-        let clock = self.clock;
-
         self.spawn_task("cancel_all_orders", async move {
             let canceled_orders = http_client.cancel_all_orders(command.instrument_id).await?;
 
-            // Generate OrderCanceled events for each canceled order
-            for (venue_order_id, client_order_id) in canceled_orders {
-                let canceled_event = OrderCanceled::new(
-                    trader_id,
-                    command.strategy_id,
-                    command.instrument_id,
-                    client_order_id,
-                    UUID4::new(),
-                    command.ts_init,
-                    clock.get_time_ns(),
-                    false,
-                    Some(venue_order_id),
-                    Some(account_id),
-                );
-
-                event_emitter.send_order_event(OrderEventAny::Canceled(canceled_event));
-            }
+            // HTTP only logs success. OrderCanceled events come from UDS WebSocket
+            // push events (executionReport with x=CANCELED for each order).
+            log::debug!(
+                "Cancel-all request accepted: instrument={}, count={}",
+                command.instrument_id,
+                canceled_orders.len(),
+            );
 
             Ok(())
         });
@@ -947,23 +928,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                             let cancel = &chunk[i];
                             match result {
                                 BatchCancelResult::Success(success) => {
-                                    let venue_order_id =
-                                        VenueOrderId::new(success.order_id.to_string());
-                                    let canceled_event = OrderCanceled::new(
-                                        trader_id,
-                                        cancel.strategy_id,
-                                        cancel.instrument_id,
+                                    // HTTP only logs success. OrderCanceled comes from
+                                    // UDS WebSocket push event.
+                                    log::debug!(
+                                        "Batch cancel accepted: client_order_id={}, order_id={}",
                                         cancel.client_order_id,
-                                        UUID4::new(),
-                                        cancel.ts_init,
-                                        clock.get_time_ns(),
-                                        false,
-                                        Some(venue_order_id),
-                                        Some(account_id),
+                                        success.order_id,
                                     );
-
-                                    event_emitter
-                                        .send_order_event(OrderEventAny::Canceled(canceled_event));
                                 }
                                 BatchCancelResult::Error(error) => {
                                     let rejected_event = OrderCancelRejected::new(
