@@ -295,18 +295,49 @@ impl BinanceSpotExecWsFeedHandler {
         let ts_event = UnixNanos::from((report.event_time as u64) * 1_000_000);
         let ts_init = self.clock.get_time_ns();
 
-        // Parse fill values
-        let last_qty: f64 = report.last_qty.parse().unwrap_or(0.0);
-        let last_px: f64 = report.last_price.parse().unwrap_or(0.0);
-        let cum_qty: f64 = report.cumulative_filled_qty.parse().unwrap_or(0.0);
-        let original_qty: f64 = report.orig_qty.parse().unwrap_or(0.0);
+        // Parse critical fill values — skip event on parse failure to avoid
+        // emitting a zero-quantity or zero-price fill to the strategy.
+        let last_qty: f64 = match report.last_qty.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    "Failed to parse last_qty '{}': {e}, skipping fill",
+                    report.last_qty
+                );
+                return None;
+            }
+        };
+        let last_px: f64 = match report.last_price.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    "Failed to parse last_price '{}': {e}, skipping fill",
+                    report.last_price
+                );
+                return None;
+            }
+        };
+        let cum_qty: f64 = report.cumulative_filled_qty.parse().unwrap_or_else(|e| {
+            log::warn!("Failed to parse cumulative_filled_qty '{}': {e}", report.cumulative_filled_qty);
+            0.0
+        });
+        let original_qty: f64 = report.orig_qty.parse().unwrap_or_else(|e| {
+            log::warn!("Failed to parse orig_qty '{}': {e}", report.orig_qty);
+            0.0
+        });
         let leaves_qty = original_qty - cum_qty;
-        let commission: f64 = report.commission.parse().unwrap_or(0.0);
+        let commission: f64 = report.commission.parse().unwrap_or_else(|e| {
+            log::warn!("Failed to parse commission '{}': {e}", report.commission);
+            0.0
+        });
 
         let commission_currency = report
             .commission_asset
             .as_ref()
-            .map_or_else(Currency::USDT, |a| Currency::from(a.as_str()));
+            .map_or_else(|| {
+                log::debug!("No commission_asset in fill, defaulting to USDT");
+                Currency::USDT()
+            }, |a| Currency::from(a.as_str()));
 
         // Map order side from Binance string
         let order_side = match report.side.as_str() {
@@ -315,6 +346,18 @@ impl BinanceSpotExecWsFeedHandler {
             _ => {
                 log::error!("Unknown order side: {}", report.side);
                 return None;
+            }
+        };
+
+        // Map order type from Binance string
+        let order_type = match report.order_type.as_str() {
+            "LIMIT" | "LIMIT_MAKER" => OrderType::Limit,
+            "MARKET" => OrderType::Market,
+            "STOP_LOSS" | "TAKE_PROFIT" => OrderType::StopMarket,
+            "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => OrderType::StopLimit,
+            other => {
+                log::warn!("Unknown order type '{other}', defaulting to Limit");
+                OrderType::Limit
             }
         };
 
@@ -333,7 +376,7 @@ impl BinanceSpotExecWsFeedHandler {
             self.account_id,
             TradeId::new(report.trade_id.to_string()),
             order_side,
-            OrderType::Limit,
+            order_type,
             Quantity::new(last_qty, qty_precision),
             Price::new(last_px, price_precision),
             commission_currency,
