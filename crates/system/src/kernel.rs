@@ -296,9 +296,9 @@ impl NautilusKernel {
             msgbus::{
                 MStr, ShareableMessageHandler, subscribe_account_state, subscribe_any,
                 subscribe_bars, subscribe_book_deltas, subscribe_book_depth10,
-                subscribe_funding_rates, subscribe_index_prices, subscribe_mark_prices,
-                subscribe_order_events, subscribe_position_events, subscribe_quotes,
-                subscribe_trades, typed_handler::TypedHandler,
+                subscribe_book_snapshots, subscribe_funding_rates, subscribe_index_prices,
+                subscribe_mark_prices, subscribe_order_events, subscribe_position_events,
+                subscribe_quotes, subscribe_trades, typed_handler::TypedHandler,
             },
         };
         use nautilus_model::{
@@ -308,6 +308,7 @@ impl NautilusKernel {
             },
             events::{AccountState, OrderEventAny, position::PositionEvent},
             instruments::InstrumentAny,
+            orderbook::book::OrderBook,
         };
         use nautilus_persistence::{
             backend::feather::{FeatherWriter, RotationConfig as FeatherRotation},
@@ -575,6 +576,22 @@ impl NautilusKernel {
             MStr::pattern("*"),
             TypedHandler::<AccountState>::from(move |state: &AccountState| {
                 let _ = tx_as.send(Box::new(state.clone()));
+            }),
+            None,
+        );
+
+        // Order book snapshots — convert full OrderBook to deltas for Arrow serialization.
+        // OrderBook has no Arrow schema (variable depth, BTreeMap internals), but
+        // to_deltas() produces OrderBookDelta events with F_SNAPSHOT + F_LAST flags
+        // that dispatch_write already handles. This enables full book reconstruction.
+        let tx_bs = tx.clone();
+        subscribe_book_snapshots(
+            MStr::pattern("*"),
+            TypedHandler::<OrderBook>::from(move |book: &OrderBook| {
+                let snapshot = book.to_deltas(book.ts_last, book.ts_last);
+                for delta in &snapshot.deltas {
+                    let _ = tx_bs.send(Box::new(*delta));
+                }
             }),
             None,
         );
