@@ -49,7 +49,7 @@ use crate::common::credential::Credential;
 const DEFAULT_WS_API_URL: &str = "wss://ws-api.binance.com:443/ws-api/v3";
 
 /// Testnet WebSocket API URL for Binance Spot User Data Stream.
-const TESTNET_WS_API_URL: &str = "wss://testnet.binance.vision/ws-api/v3";
+const TESTNET_WS_API_URL: &str = "wss://ws-api.testnet.binance.vision/ws-api/v3";
 
 /// Binance Spot User Data Stream WebSocket client.
 ///
