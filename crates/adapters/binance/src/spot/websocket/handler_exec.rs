@@ -911,4 +911,198 @@ mod tests {
         // Active orders preserved
         assert!(handler.active_orders.contains_key(&client_order_id));
     }
+
+    // --- Integration tests: full command+event pipeline ---
+    //
+    // These tests use direct handle_command() for deterministic command
+    // processing, then handler.next() only for event-driven flows.
+    // This avoids tokio::select! ordering races between cmd_rx and event_rx.
+
+    #[tokio::test]
+    async fn test_full_flow_register_then_fill_via_next() {
+        let (mut handler, _cmd_tx, event_tx) = test_handler();
+
+        // Directly process commands (deterministic, no select! race)
+        handler.handle_command(SpotExecHandlerCommand::CacheInstrument {
+            symbol: "ETHUSDC".to_string(),
+            price_precision: 2,
+            qty_precision: 5,
+        });
+        handler.handle_command(SpotExecHandlerCommand::RegisterOrder {
+            client_order_id: ClientOrderId::new("INT-001"),
+            trader_id: TraderId::new("TESTER-001"),
+            strategy_id: StrategyId::new("CrossMM-001"),
+            instrument_id: InstrumentId::from("ETHUSDC.BINANCE"),
+        });
+
+        // Send fill event via channel, then retrieve via next()
+        event_tx
+            .send(BinanceSpotUserDataEvent::ExecutionReport(Box::new(
+                make_trade_report(
+                    "INT-001",
+                    555_666_777,
+                    "ETHUSDC",
+                    "0.01",
+                    "2045.50",
+                    "0.01",
+                    "0.01",
+                ),
+            )))
+            .expect("send failed");
+
+        let result = handler.next().await;
+        assert!(result.is_some());
+
+        match result.unwrap() {
+            NautilusSpotExecWsMessage::OrderFilled(filled) => {
+                assert_eq!(filled.client_order_id, ClientOrderId::new("INT-001"));
+                assert_eq!(filled.strategy_id, StrategyId::new("CrossMM-001"));
+            }
+            other => panic!("Expected OrderFilled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_fill_keeps_order_active_via_next() {
+        let (mut handler, _cmd_tx, event_tx) = test_handler();
+
+        handler.handle_command(SpotExecHandlerCommand::CacheInstrument {
+            symbol: "ETHUSDC".to_string(),
+            price_precision: 2,
+            qty_precision: 5,
+        });
+        handler.handle_command(SpotExecHandlerCommand::RegisterOrder {
+            client_order_id: ClientOrderId::new("PARTIAL-001"),
+            trader_id: TraderId::new("TESTER-001"),
+            strategy_id: StrategyId::new("CrossMM-001"),
+            instrument_id: InstrumentId::from("ETHUSDC.BINANCE"),
+        });
+
+        // Partial fill: 0.005 of 0.01
+        event_tx
+            .send(BinanceSpotUserDataEvent::ExecutionReport(Box::new(
+                make_trade_report(
+                    "PARTIAL-001",
+                    888_001,
+                    "ETHUSDC",
+                    "0.005",
+                    "2045.50",
+                    "0.01",
+                    "0.005",
+                ),
+            )))
+            .expect("send failed");
+
+        let result = handler.next().await;
+        assert!(result.is_some());
+        assert!(matches!(
+            result.unwrap(),
+            NautilusSpotExecWsMessage::OrderFilled(_)
+        ));
+
+        // Order should still be active (partially filled)
+        assert!(handler
+            .active_orders
+            .contains_key(&ClientOrderId::new("PARTIAL-001")));
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_then_fill_via_next() {
+        let (mut handler, _cmd_tx, event_tx) = test_handler();
+
+        handler.handle_command(SpotExecHandlerCommand::CacheInstrument {
+            symbol: "ETHUSDC".to_string(),
+            price_precision: 2,
+            qty_precision: 5,
+        });
+        handler.handle_command(SpotExecHandlerCommand::RegisterOrder {
+            client_order_id: ClientOrderId::new("RECON-001"),
+            trader_id: TraderId::new("TESTER-001"),
+            strategy_id: StrategyId::new("CrossMM-001"),
+            instrument_id: InstrumentId::from("ETHUSDC.BINANCE"),
+        });
+
+        // Reconnection event
+        event_tx
+            .send(BinanceSpotUserDataEvent::Reconnected)
+            .expect("send failed");
+
+        let result = handler.next().await;
+        assert!(matches!(
+            result,
+            Some(NautilusSpotExecWsMessage::Reconnected)
+        ));
+
+        // Pending was drained, but active_orders preserved
+        assert!(handler.pending_place_requests.is_empty());
+        assert!(handler
+            .active_orders
+            .contains_key(&ClientOrderId::new("RECON-001")));
+
+        // Fill still works via active_orders after reconnect
+        event_tx
+            .send(BinanceSpotUserDataEvent::ExecutionReport(Box::new(
+                make_trade_report(
+                    "RECON-001",
+                    999_001,
+                    "ETHUSDC",
+                    "0.01",
+                    "2045.50",
+                    "0.01",
+                    "0.01",
+                ),
+            )))
+            .expect("send failed");
+
+        let result = handler.next().await;
+        assert!(result.is_some());
+        match result.unwrap() {
+            NautilusSpotExecWsMessage::OrderFilled(filled) => {
+                assert_eq!(filled.client_order_id, ClientOrderId::new("RECON-001"));
+                assert_eq!(filled.strategy_id, StrategyId::new("CrossMM-001"));
+            }
+            other => panic!("Expected OrderFilled after reconnect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_account_position_via_next() {
+        let (mut handler, _cmd_tx, event_tx) = test_handler();
+
+        let position = super::super::types_exec::BinanceSpotAccountPosition {
+            event_type: "outboundAccountPosition".to_string(),
+            event_time: 1_772_494_856_997,
+            update_time: 1_772_494_856_997,
+            balances: vec![super::super::types_exec::BinanceSpotBalance {
+                asset: "ETH".to_string(),
+                free: "0.14741228".to_string(),
+                locked: "0.00000000".to_string(),
+            }],
+        };
+
+        event_tx
+            .send(BinanceSpotUserDataEvent::AccountPosition(position))
+            .expect("send failed");
+
+        let result = handler.next().await;
+        assert!(result.is_some());
+
+        match result.unwrap() {
+            NautilusSpotExecWsMessage::AccountUpdate(state) => {
+                assert!(!state.balances.is_empty());
+            }
+            other => panic!("Expected AccountUpdate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_stops_handler() {
+        let (mut handler, _cmd_tx, _event_tx) = test_handler();
+
+        // Set shutdown signal
+        handler.signal.store(true, Ordering::Relaxed);
+
+        let result = handler.next().await;
+        assert!(result.is_none(), "Handler should return None on shutdown");
+    }
 }

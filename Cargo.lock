@@ -5928,6 +5928,7 @@ dependencies = [
  "pyo3",
  "rstest",
  "sysinfo",
+ "tokio",
  "ustr",
 ]
 
