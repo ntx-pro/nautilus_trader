@@ -577,21 +577,27 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
-        // Signal handler to stop and drop command channel (unblocks handler.next())
+        // Signal handler to stop and drop command channel
         self.handler_signal.store(true, Ordering::Relaxed);
         self.exec_cmd_tx = None;
 
-        // Wait for handler task to process remaining events before closing WS
-        let uds_task = self.uds_task.lock().expect(MUTEX_POISONED).take();
-        if let Some(task) = uds_task {
-            let _ = task.await;
-        }
-
-        // Disconnect UDS WebSocket after handler has stopped
+        // Disconnect UDS WebSocket first — this aborts the process_task which
+        // drops event_tx, causing handler's event_rx to close. Without this,
+        // handler.next() blocks indefinitely on the open event_rx channel
+        // (Q-009: shutdown timeout >15s).
         if let Some(ref mut uds_client) = self.uds_client {
             uds_client.disconnect().await;
         }
         self.uds_client = None;
+
+        // Await handler task with timeout — should exit quickly now that both
+        // channels are closed, but abort after 5s as a safety net.
+        let uds_task = self.uds_task.lock().expect(MUTEX_POISONED).take();
+        if let Some(task) = uds_task
+            && tokio::time::timeout(Duration::from_secs(5), task).await.is_err()
+        {
+            log::warn!("UDS handler task did not stop within 5s, aborting");
+        }
 
         self.abort_pending_tasks();
 
