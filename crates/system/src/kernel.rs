@@ -380,21 +380,27 @@ impl NautilusKernel {
 
                     let mut last_flush = std::time::Instant::now();
                     let flush_interval = std::time::Duration::from_millis(flush_interval_ms);
+                    let mut recv_count: u64 = 0;
 
                     loop {
                         match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                             Ok(data) => {
+                                recv_count += 1;
+                                if recv_count <= 5 || recv_count % 1000 == 0 {
+                                    log::info!("[STREAMING-DEBUG] recv #{recv_count} type_id={:?}", (*data).type_id());
+                                }
                                 Self::dispatch_write(&mut writer, data).await;
                             }
                             Err(RecvTimeoutError::Timeout) => {}
                             Err(RecvTimeoutError::Disconnected) => {
-                                log::info!("Streaming channel disconnected, flushing and exiting");
+                                log::info!("Streaming channel disconnected after {recv_count} events, flushing");
                                 break;
                             }
                         }
 
                         // Periodic flush based on configured interval
                         if last_flush.elapsed() >= flush_interval {
+                            log::info!("[STREAMING-DEBUG] flush tick, {recv_count} events total");
                             if let Err(e) = writer.flush().await {
                                 log::warn!("Streaming flush error: {e}");
                             }
@@ -412,7 +418,13 @@ impl NautilusKernel {
 
         // Subscribe a lightweight handler to the message bus that forwards events
         // through the channel. Each send is ~100ns — zero I/O on the event loop.
+        let handler_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handler_count_c = handler_count.clone();
         let handler = ShareableMessageHandler::from_any(move |message: &dyn Any| {
+            let n = handler_count_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 || n % 5000 == 0 {
+                log::info!("[STREAMING-DEBUG] handler #{n} type_id={:?}", message.type_id());
+            }
             // Market data (Copy types)
             if let Some(q) = message.downcast_ref::<QuoteTick>() {
                 let _ = tx.send(Box::new(*q));
