@@ -32,6 +32,7 @@
 //! - Cancel-replace operations
 
 pub mod error;
+pub mod handler_exec;
 pub mod messages_exec;
 pub mod streams;
 pub mod trading;
