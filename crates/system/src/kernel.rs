@@ -153,11 +153,8 @@ impl NautilusKernel {
         // Uses a dedicated writer thread to avoid blocking the trading event loop.
         #[cfg(feature = "streaming")]
         if let Some(streaming_config) = config.streaming()
-            && let Err(e) = Self::setup_streaming(
-                &streaming_config,
-                config.environment(),
-                instance_id,
-            )
+            && let Err(e) =
+                Self::setup_streaming(&streaming_config, config.environment(), instance_id)
         {
             log::error!("Failed to setup streaming: {e}");
         }
@@ -289,43 +286,43 @@ impl NautilusKernel {
         environment: Environment,
         instance_id: UUID4,
     ) -> anyhow::Result<()> {
-        use std::any::Any;
-        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::{
+            any::Any,
+            sync::mpsc::{self, RecvTimeoutError},
+        };
 
-        use nautilus_common::live::clock::LiveClock;
-        use nautilus_common::msgbus::{subscribe_any, MStr, ShareableMessageHandler};
+        use nautilus_common::{
+            live::clock::LiveClock,
+            msgbus::{
+                MStr, ShareableMessageHandler, subscribe_account_state, subscribe_any,
+                subscribe_bars, subscribe_book_deltas, subscribe_book_depth10,
+                subscribe_funding_rates, subscribe_index_prices, subscribe_mark_prices,
+                subscribe_order_events, subscribe_position_events, subscribe_quotes,
+                subscribe_trades, typed_handler::TypedHandler,
+            },
+        };
         use nautilus_model::{
             data::{
-                Bar, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta,
-                OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
+                Bar, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
+                OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
             },
-            events::{
-                AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-                OrderEmulated, OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected,
-                OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-                OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged,
-                PositionClosed, PositionOpened,
-            },
+            events::{AccountState, OrderEventAny, position::PositionEvent},
             instruments::InstrumentAny,
         };
-        use nautilus_persistence::backend::feather::{
-            FeatherWriter, RotationConfig as FeatherRotation,
+        use nautilus_persistence::{
+            backend::feather::{FeatherWriter, RotationConfig as FeatherRotation},
+            parquet::create_object_store_from_path,
         };
-        use nautilus_persistence::parquet::create_object_store_from_path;
 
-        let catalog_path = format!(
-            "{}/{}/{}",
-            config.catalog_path,
-            environment,
-            instance_id,
-        );
+        let catalog_path = format!("{}/{}/{}", config.catalog_path, environment, instance_id,);
 
         // Ensure the catalog directory exists for LocalFileSystem (requires canonical path).
         if config.fs_protocol == "file" {
-            std::fs::create_dir_all(&catalog_path)
-                .map_err(|e| anyhow::anyhow!(
+            std::fs::create_dir_all(&catalog_path).map_err(|e| {
+                anyhow::anyhow!(
                     "failed to create streaming catalog directory '{catalog_path}': {e}"
-                ))?;
+                )
+            })?;
         }
 
         let flush_interval_ms = config.flush_interval_ms;
@@ -334,12 +331,12 @@ impl NautilusKernel {
         let (store, base_path, _scheme) = create_object_store_from_path(&catalog_path, None)?;
 
         let rotation = match &config.rotation_config {
-            crate::config::RotationConfig::Size { max_size } => {
-                FeatherRotation::Size { max_size: *max_size }
-            }
-            crate::config::RotationConfig::Interval { interval_ns } => {
-                FeatherRotation::Interval { interval_ns: *interval_ns }
-            }
+            crate::config::RotationConfig::Size { max_size } => FeatherRotation::Size {
+                max_size: *max_size,
+            },
+            crate::config::RotationConfig::Interval { interval_ns } => FeatherRotation::Interval {
+                interval_ns: *interval_ns,
+            },
             crate::config::RotationConfig::ScheduledDates { .. } => {
                 log::warn!(
                     "ScheduledDates rotation not supported in Rust streaming, using NoRotation"
@@ -386,9 +383,6 @@ impl NautilusKernel {
                         match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                             Ok(data) => {
                                 recv_count += 1;
-                                if recv_count <= 5 || recv_count % 1000 == 0 {
-                                    log::info!("[STREAMING-DEBUG] recv #{recv_count} type_id={:?}", (*data).type_id());
-                                }
                                 Self::dispatch_write(&mut writer, data).await;
                             }
                             Err(RecvTimeoutError::Timeout) => {}
@@ -400,7 +394,6 @@ impl NautilusKernel {
 
                         // Periodic flush based on configured interval
                         if last_flush.elapsed() >= flush_interval {
-                            log::info!("[STREAMING-DEBUG] flush tick, {recv_count} events total");
                             if let Err(e) = writer.flush().await {
                                 log::warn!("Streaming flush error: {e}");
                             }
@@ -416,89 +409,187 @@ impl NautilusKernel {
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn streaming writer thread: {e}"))?;
 
-        // Subscribe a lightweight handler to the message bus that forwards events
-        // through the channel. Each send is ~100ns — zero I/O on the event loop.
-        let handler_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let handler_count_c = handler_count.clone();
-        let handler = ShareableMessageHandler::from_any(move |message: &dyn Any| {
-            let n = handler_count_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 3 || n % 5000 == 0 {
-                log::info!("[STREAMING-DEBUG] handler #{n} type_id={:?}", message.type_id());
-            }
-            // Market data (Copy types)
-            if let Some(q) = message.downcast_ref::<QuoteTick>() {
-                let _ = tx.send(Box::new(*q));
-            } else if let Some(t) = message.downcast_ref::<TradeTick>() {
-                let _ = tx.send(Box::new(*t));
-            } else if let Some(b) = message.downcast_ref::<Bar>() {
-                let _ = tx.send(Box::new(*b));
-            } else if let Some(d) = message.downcast_ref::<OrderBookDelta>() {
-                let _ = tx.send(Box::new(*d));
-            } else if let Some(d) = message.downcast_ref::<OrderBookDepth10>() {
-                let _ = tx.send(Box::new(*d));
-            } else if let Some(d) = message.downcast_ref::<OrderBookDeltas>() {
-                for delta in &d.deltas {
-                    let _ = tx.send(Box::new(*delta));
+        // Subscribe typed handlers to the message bus. Each typed router in NT has
+        // its own publish/subscribe path — subscribe_any("*") only captures events
+        // sent via publish_any() (instruments, instrument closes). All market data and
+        // execution events use typed routers and require explicit typed subscriptions.
+        // Each handler send is ~100ns — zero I/O on the event loop.
+
+        // Market data — Copy types, one handler per typed router
+        let tx_q = tx.clone();
+        subscribe_quotes(
+            MStr::pattern("*"),
+            TypedHandler::<QuoteTick>::from(move |quote: &QuoteTick| {
+                let _ = tx_q.send(Box::new(*quote));
+            }),
+            None,
+        );
+
+        let tx_t = tx.clone();
+        subscribe_trades(
+            MStr::pattern("*"),
+            TypedHandler::<TradeTick>::from(move |trade: &TradeTick| {
+                let _ = tx_t.send(Box::new(*trade));
+            }),
+            None,
+        );
+
+        let tx_b = tx.clone();
+        subscribe_bars(
+            MStr::pattern("*"),
+            TypedHandler::<Bar>::from(move |bar: &Bar| {
+                let _ = tx_b.send(Box::new(*bar));
+            }),
+            None,
+        );
+
+        // OrderBookDeltas contains Vec<OrderBookDelta> — unwrap to individual deltas
+        let tx_d = tx.clone();
+        subscribe_book_deltas(
+            MStr::pattern("*"),
+            TypedHandler::<OrderBookDeltas>::from(move |deltas: &OrderBookDeltas| {
+                for delta in &deltas.deltas {
+                    let _ = tx_d.send(Box::new(*delta));
                 }
-            } else if let Some(p) = message.downcast_ref::<IndexPriceUpdate>() {
-                let _ = tx.send(Box::new(*p));
-            } else if let Some(p) = message.downcast_ref::<MarkPriceUpdate>() {
-                let _ = tx.send(Box::new(*p));
+            }),
+            None,
+        );
+
+        let tx_d10 = tx.clone();
+        subscribe_book_depth10(
+            MStr::pattern("*"),
+            TypedHandler::<OrderBookDepth10>::from(move |depth: &OrderBookDepth10| {
+                let _ = tx_d10.send(Box::new(*depth));
+            }),
+            None,
+        );
+
+        let tx_mp = tx.clone();
+        subscribe_mark_prices(
+            MStr::pattern("*"),
+            TypedHandler::<MarkPriceUpdate>::from(move |update: &MarkPriceUpdate| {
+                let _ = tx_mp.send(Box::new(*update));
+            }),
+            None,
+        );
+
+        let tx_ip = tx.clone();
+        subscribe_index_prices(
+            MStr::pattern("*"),
+            TypedHandler::<IndexPriceUpdate>::from(move |update: &IndexPriceUpdate| {
+                let _ = tx_ip.send(Box::new(*update));
+            }),
+            None,
+        );
+
+        let tx_fr = tx.clone();
+        subscribe_funding_rates(
+            MStr::pattern("*"),
+            TypedHandler::<FundingRateUpdate>::from(move |rate: &FundingRateUpdate| {
+                let _ = tx_fr.send(Box::new(*rate));
+            }),
+            None,
+        );
+
+        // Order events — unwrap OrderEventAny enum to individual types for Arrow schemas.
+        // All variants are Copy except OrderInitialized (IndexMap field, requires clone).
+        let tx_oe = tx.clone();
+        subscribe_order_events(
+            MStr::pattern("*"),
+            TypedHandler::<OrderEventAny>::from(move |evt: &OrderEventAny| match evt {
+                OrderEventAny::Initialized(e) => {
+                    let _ = tx_oe.send(Box::new(e.clone()));
+                }
+                OrderEventAny::Denied(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Emulated(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Released(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Submitted(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Accepted(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Rejected(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Canceled(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Expired(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Triggered(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::PendingUpdate(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::PendingCancel(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::ModifyRejected(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::CancelRejected(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Updated(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+                OrderEventAny::Filled(e) => {
+                    let _ = tx_oe.send(Box::new(*e));
+                }
+            }),
+            None,
+        );
+
+        // Position events — unwrap PositionEvent enum to individual types.
+        // PositionAdjusted is Copy; others require clone.
+        let tx_pe = tx.clone();
+        subscribe_position_events(
+            MStr::pattern("*"),
+            TypedHandler::<PositionEvent>::from(move |evt: &PositionEvent| match evt {
+                PositionEvent::PositionOpened(e) => {
+                    let _ = tx_pe.send(Box::new(e.clone()));
+                }
+                PositionEvent::PositionChanged(e) => {
+                    let _ = tx_pe.send(Box::new(e.clone()));
+                }
+                PositionEvent::PositionClosed(e) => {
+                    let _ = tx_pe.send(Box::new(e.clone()));
+                }
+                PositionEvent::PositionAdjusted(e) => {
+                    let _ = tx_pe.send(Box::new(*e));
+                }
+            }),
+            None,
+        );
+
+        // Account state — Clone only (contains balance maps)
+        let tx_as = tx.clone();
+        subscribe_account_state(
+            MStr::pattern("*"),
+            TypedHandler::<AccountState>::from(move |state: &AccountState| {
+                let _ = tx_as.send(Box::new(state.clone()));
+            }),
+            None,
+        );
+
+        // Instruments and instrument closes — these go through publish_any(),
+        // so subscribe_any is the correct subscription for them.
+        let handler = ShareableMessageHandler::from_any(move |message: &dyn Any| {
+            if let Some(i) = message.downcast_ref::<InstrumentAny>() {
+                let _ = tx.send(Box::new(i.clone()));
             } else if let Some(c) = message.downcast_ref::<InstrumentClose>() {
                 let _ = tx.send(Box::new(*c));
-            } else if let Some(i) = message.downcast_ref::<InstrumentAny>() {
-                let _ = tx.send(Box::new(i.clone()));
-            // Order events (Copy types)
-            } else if let Some(e) = message.downcast_ref::<OrderFilled>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderAccepted>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderCanceled>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderRejected>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderSubmitted>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderDenied>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderExpired>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderTriggered>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderUpdated>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderPendingCancel>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderPendingUpdate>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderCancelRejected>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderModifyRejected>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderEmulated>() {
-                let _ = tx.send(Box::new(*e));
-            } else if let Some(e) = message.downcast_ref::<OrderReleased>() {
-                let _ = tx.send(Box::new(*e));
-            // Order events (Clone only — OrderInitialized has IndexMap)
-            } else if let Some(e) = message.downcast_ref::<OrderInitialized>() {
-                let _ = tx.send(Box::new(e.clone()));
-            // Position events (Clone only)
-            } else if let Some(e) = message.downcast_ref::<PositionOpened>() {
-                let _ = tx.send(Box::new(e.clone()));
-            } else if let Some(e) = message.downcast_ref::<PositionChanged>() {
-                let _ = tx.send(Box::new(e.clone()));
-            } else if let Some(e) = message.downcast_ref::<PositionClosed>() {
-                let _ = tx.send(Box::new(e.clone()));
-            } else if let Some(e) = message.downcast_ref::<PositionAdjusted>() {
-                let _ = tx.send(Box::new(*e));
-            // Account events (Clone only)
-            } else if let Some(e) = message.downcast_ref::<AccountState>() {
-                let _ = tx.send(Box::new(e.clone()));
-            } else if let Some(e) = message.downcast_ref::<FundingRateUpdate>() {
-                let _ = tx.send(Box::new(*e));
             }
         });
-
         subscribe_any(MStr::pattern("*"), handler, None);
 
         log::info!(
@@ -510,7 +601,10 @@ impl NautilusKernel {
 
     /// Dispatches a boxed event to the appropriate FeatherWriter write method.
     #[cfg(feature = "streaming")]
-    async fn dispatch_write(writer: &mut nautilus_persistence::backend::feather::FeatherWriter, data: Box<dyn std::any::Any + Send>) {
+    async fn dispatch_write(
+        writer: &mut nautilus_persistence::backend::feather::FeatherWriter,
+        data: Box<dyn std::any::Any + Send>,
+    ) {
         use nautilus_model::{
             data::{
                 Bar, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta,
@@ -540,9 +634,17 @@ impl NautilusKernel {
         }
 
         // Market data
-        try_write!(data, writer,
-            QuoteTick, TradeTick, Bar, OrderBookDelta, OrderBookDepth10,
-            IndexPriceUpdate, MarkPriceUpdate, InstrumentClose,
+        try_write!(
+            data,
+            writer,
+            QuoteTick,
+            TradeTick,
+            Bar,
+            OrderBookDelta,
+            OrderBookDepth10,
+            IndexPriceUpdate,
+            MarkPriceUpdate,
+            InstrumentClose,
         );
 
         // Instruments (special write path)
@@ -554,16 +656,35 @@ impl NautilusKernel {
         }
 
         // Order events
-        try_write!(data, writer,
-            OrderFilled, OrderAccepted, OrderCanceled, OrderRejected,
-            OrderInitialized, OrderSubmitted, OrderDenied, OrderExpired,
-            OrderTriggered, OrderUpdated, OrderPendingCancel, OrderPendingUpdate,
-            OrderCancelRejected, OrderModifyRejected, OrderEmulated, OrderReleased,
+        try_write!(
+            data,
+            writer,
+            OrderFilled,
+            OrderAccepted,
+            OrderCanceled,
+            OrderRejected,
+            OrderInitialized,
+            OrderSubmitted,
+            OrderDenied,
+            OrderExpired,
+            OrderTriggered,
+            OrderUpdated,
+            OrderPendingCancel,
+            OrderPendingUpdate,
+            OrderCancelRejected,
+            OrderModifyRejected,
+            OrderEmulated,
+            OrderReleased,
         );
 
         // Position events
-        try_write!(data, writer,
-            PositionOpened, PositionChanged, PositionClosed, PositionAdjusted,
+        try_write!(
+            data,
+            writer,
+            PositionOpened,
+            PositionChanged,
+            PositionClosed,
+            PositionAdjusted,
         );
 
         // Account + funding
