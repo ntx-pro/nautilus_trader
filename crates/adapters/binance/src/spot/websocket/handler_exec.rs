@@ -651,7 +651,6 @@ mod tests {
         cum_qty: &str,
     ) -> BinanceSpotExecutionReport {
         BinanceSpotExecutionReport {
-            event_type: "executionReport".to_string(),
             event_time: 1_772_494_860_000,
             symbol: symbol.to_string(),
             client_order_id: client_order_id.to_string(),
@@ -1177,7 +1176,6 @@ mod tests {
         let (mut handler, _cmd_tx, event_tx) = test_handler();
 
         let position = super::super::types_exec::BinanceSpotAccountPosition {
-            event_type: "outboundAccountPosition".to_string(),
             event_time: 1_772_494_856_997,
             update_time: 1_772_494_856_997,
             balances: vec![super::super::types_exec::BinanceSpotBalance {

@@ -39,9 +39,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::{
     messages_exec::BinanceSpotUserDataEvent,
-    types_exec::{
-        BinanceSpotAccountPosition, BinanceSpotExecutionReport, UserDataStreamFrame,
-    },
+    types_exec::{UserDataStreamEvent, UserDataStreamFrame},
 };
 use crate::common::credential::Credential;
 
@@ -319,66 +317,48 @@ impl BinanceSpotUserDataStream {
     /// 1. UDS push events: `{"subscriptionId": N, "event": {...}}`
     /// 2. Subscribe response: `{"id": "...", "status": 200, ...}`
     /// 3. Unknown: logged and skipped
+    ///
+    /// Push events are deserialized in a single pass using the tagged
+    /// [`UserDataStreamEvent`] enum (keyed on the `"e"` field), avoiding
+    /// the overhead of intermediate `serde_json::Value` allocation.
     fn dispatch_json_message(
         text: &str,
         event_tx: &UnboundedSender<BinanceSpotUserDataEvent>,
     ) {
-        // Try to parse as UDS push event frame
+        // Try to parse as UDS push event frame (single-pass tagged deserialization)
         if let Ok(frame) = serde_json::from_str::<UserDataStreamFrame>(text) {
-            let event_type = frame
-                .event
-                .get("e")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            match event_type {
-                "executionReport" => {
-                    match serde_json::from_value::<BinanceSpotExecutionReport>(frame.event) {
-                        Ok(report) => {
-                            log::debug!(
-                                "UDS executionReport: symbol={}, type={:?}, client_order_id={}",
-                                report.symbol,
-                                report.execution_type,
-                                report.client_order_id,
-                            );
-                            if event_tx
-                                .send(BinanceSpotUserDataEvent::ExecutionReport(Box::new(
-                                    report,
-                                )))
-                                .is_err()
-                            {
-                                log::error!("Event channel closed");
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to parse executionReport: {e}");
-                        }
+            match frame.event {
+                UserDataStreamEvent::ExecutionReport(report) => {
+                    log::debug!(
+                        "UDS executionReport: symbol={}, type={:?}, client_order_id={}",
+                        report.symbol,
+                        report.execution_type,
+                        report.client_order_id,
+                    );
+                    if event_tx
+                        .send(BinanceSpotUserDataEvent::ExecutionReport(report))
+                        .is_err()
+                    {
+                        log::error!("Event channel closed");
                     }
                 }
-                "outboundAccountPosition" => {
-                    match serde_json::from_value::<BinanceSpotAccountPosition>(frame.event) {
-                        Ok(position) => {
-                            log::debug!(
-                                "UDS outboundAccountPosition: {} balance(s)",
-                                position.balances.len(),
-                            );
-                            if event_tx
-                                .send(BinanceSpotUserDataEvent::AccountPosition(position))
-                                .is_err()
-                            {
-                                log::error!("Event channel closed");
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to parse outboundAccountPosition: {e}");
-                        }
+                UserDataStreamEvent::AccountPosition(position) => {
+                    log::debug!(
+                        "UDS outboundAccountPosition: {} balance(s)",
+                        position.balances.len(),
+                    );
+                    if event_tx
+                        .send(BinanceSpotUserDataEvent::AccountPosition(position))
+                        .is_err()
+                    {
+                        log::error!("Event channel closed");
                     }
                 }
-                "balanceUpdate" => {
+                UserDataStreamEvent::BalanceUpdate(_) => {
                     log::debug!("UDS balanceUpdate received (log only)");
                 }
-                _ => {
-                    log::debug!("UDS unknown event type: {event_type}");
+                UserDataStreamEvent::Unknown => {
+                    log::debug!("UDS unknown event type");
                 }
             }
 

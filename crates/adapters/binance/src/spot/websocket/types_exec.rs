@@ -29,15 +29,36 @@ use crate::spot::enums::BinanceSpotOrderType;
 /// Wrapper for all User Data Stream push events from Binance Spot.
 ///
 /// All push events arrive in this envelope format after subscribing via
-/// `userDataStream.subscribe.signature`. The `event` field contains the
-/// actual Binance event payload.
+/// `userDataStream.subscribe.signature`. The inner `event` is deserialized
+/// directly to the correct variant using the `"e"` tag in a single pass.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserDataStreamFrame {
     /// Subscription identifier returned by the subscribe response.
     #[serde(rename = "subscriptionId")]
     pub subscription_id: u64,
-    /// The raw event payload (dispatched by the `"e"` field).
-    pub event: serde_json::Value,
+    /// The typed event payload, dispatched by the `"e"` field.
+    pub event: UserDataStreamEvent,
+}
+
+/// Tagged enum for User Data Stream event types.
+///
+/// Serde routes to the correct variant based on the `"e"` field in a single
+/// deserialization pass, avoiding double-parsing through `serde_json::Value`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "e")]
+pub enum UserDataStreamEvent {
+    /// Execution report (order lifecycle events).
+    #[serde(rename = "executionReport")]
+    ExecutionReport(Box<BinanceSpotExecutionReport>),
+    /// Account position update (balance changes).
+    #[serde(rename = "outboundAccountPosition")]
+    AccountPosition(BinanceSpotAccountPosition),
+    /// Balance update (deposits, withdrawals — logged only).
+    #[serde(rename = "balanceUpdate")]
+    BalanceUpdate(serde_json::Value),
+    /// Unknown event type.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Execution type for Binance Spot `executionReport` events.
@@ -73,9 +94,9 @@ pub enum BinanceSpotExecutionType {
 /// JSON convention.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BinanceSpotExecutionReport {
-    /// Event type (always `"executionReport"`).
-    #[serde(rename = "e")]
-    pub event_type: String,
+    // Note: the `"e"` field is consumed by the `UserDataStreamEvent` tag
+    // and is not present here. It is always `"executionReport"` when this
+    // struct is deserialized via the tagged enum.
     /// Event time in milliseconds since epoch.
     #[serde(rename = "E")]
     pub event_time: i64,
@@ -190,9 +211,7 @@ pub struct BinanceSpotBalance {
 /// Emitted whenever account balances change (order placed, fill, deposit, etc.).
 #[derive(Debug, Clone, Deserialize)]
 pub struct BinanceSpotAccountPosition {
-    /// Event type (always `"outboundAccountPosition"`).
-    #[serde(rename = "e")]
-    pub event_type: String,
+    // Note: the `"e"` field is consumed by the `UserDataStreamEvent` tag.
     /// Event time in milliseconds.
     #[serde(rename = "E")]
     pub event_time: i64,
@@ -271,21 +290,47 @@ mod tests {
     }"#;
 
     #[test]
-    fn deserialize_uds_frame_wrapper() {
+    fn deserialize_uds_frame_single_pass() {
         let frame: UserDataStreamFrame = serde_json::from_str(FRAME_EXECUTION_REPORT_NEW)
             .expect("Failed to deserialize UDS frame");
         assert_eq!(frame.subscription_id, 0);
-        assert_eq!(
-            frame.event.get("e").unwrap().as_str().unwrap(),
-            "executionReport"
+        match frame.event {
+            UserDataStreamEvent::ExecutionReport(report) => {
+                assert_eq!(report.symbol, "ETHUSDC");
+                assert_eq!(report.execution_type, BinanceSpotExecutionType::New);
+            }
+            other => panic!("Expected ExecutionReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_uds_frame_account_position() {
+        let json = format!(
+            r#"{{"subscriptionId": 0, "event": {ACCOUNT_POSITION}}}"#,
         );
+        let frame: UserDataStreamFrame =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+        assert_eq!(frame.subscription_id, 0);
+        match frame.event {
+            UserDataStreamEvent::AccountPosition(pos) => {
+                assert_eq!(pos.balances.len(), 3);
+            }
+            other => panic!("Expected AccountPosition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_uds_frame_unknown_event() {
+        let json = r#"{"subscriptionId": 0, "event": {"e": "listStatus", "E": 1772494860000}}"#;
+        let frame: UserDataStreamFrame =
+            serde_json::from_str(json).expect("Failed to deserialize");
+        assert!(matches!(frame.event, UserDataStreamEvent::Unknown));
     }
 
     #[test]
     fn deserialize_execution_report_new() {
         let report: BinanceSpotExecutionReport =
             serde_json::from_str(EXECUTION_REPORT_NEW).expect("Failed to deserialize NEW");
-        assert_eq!(report.event_type, "executionReport");
         assert_eq!(report.symbol, "ETHUSDC");
         assert_eq!(report.client_order_id, "UDS-TEST-1772494856");
         assert_eq!(report.execution_type, BinanceSpotExecutionType::New);
@@ -328,7 +373,7 @@ mod tests {
     fn deserialize_account_position() {
         let position: BinanceSpotAccountPosition =
             serde_json::from_str(ACCOUNT_POSITION).expect("Failed to deserialize account position");
-        assert_eq!(position.event_type, "outboundAccountPosition");
+        // event_type ("e") is consumed by the UserDataStreamEvent tag
         assert_eq!(position.balances.len(), 3);
         assert_eq!(position.balances[0].asset, "ETH");
         assert_eq!(position.balances[0].free, "0.14741228");
