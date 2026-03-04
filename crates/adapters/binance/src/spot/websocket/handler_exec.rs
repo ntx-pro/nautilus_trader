@@ -36,7 +36,7 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use nautilus_core::{UUID4, nanos::UnixNanos, time::AtomicTime};
 use nautilus_model::{
-    enums::{AccountType, LiquiditySide, OrderSide, OrderType},
+    enums::{AccountType, LiquiditySide, OrderType},
     events::{AccountState, OrderCanceled, OrderFilled, OrderRejected},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
@@ -45,6 +45,8 @@ use nautilus_model::{
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use ustr::Ustr;
+
+use crate::common::enums::BinanceOrderStatus;
 
 use super::{
     messages_exec::{BinanceSpotUserDataEvent, NautilusSpotExecWsMessage, SpotExecHandlerCommand},
@@ -265,6 +267,14 @@ impl BinanceSpotExecWsFeedHandler {
                 );
                 None
             }
+            BinanceSpotExecutionType::Unknown => {
+                log::warn!(
+                    "Unknown execution type in report: symbol={}, client_order_id={}",
+                    report.symbol,
+                    report.client_order_id
+                );
+                None
+            }
         }
     }
 
@@ -343,27 +353,8 @@ impl BinanceSpotExecWsFeedHandler {
                 Currency::USDT()
             }, |a| Currency::from(a.as_str()));
 
-        // Map order side from Binance string
-        let order_side = match report.side.as_str() {
-            "BUY" => OrderSide::Buy,
-            "SELL" => OrderSide::Sell,
-            _ => {
-                log::error!("Unknown order side: {}", report.side);
-                return None;
-            }
-        };
-
-        // Map order type from Binance string
-        let order_type = match report.order_type.as_str() {
-            "LIMIT" | "LIMIT_MAKER" => OrderType::Limit,
-            "MARKET" => OrderType::Market,
-            "STOP_LOSS" | "TAKE_PROFIT" => OrderType::StopMarket,
-            "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => OrderType::StopLimit,
-            other => {
-                log::warn!("Unknown order type '{other}', defaulting to Limit");
-                OrderType::Limit
-            }
-        };
+        let order_side = report.side.into();
+        let order_type: OrderType = report.order_type.into();
 
         let liquidity_side = if report.is_maker {
             LiquiditySide::Maker
@@ -393,9 +384,9 @@ impl BinanceSpotExecWsFeedHandler {
             Some(Money::new(commission, commission_currency)),
         );
 
-        // Remove from active_orders if fully filled (use Binance's status
-        // string instead of f64 arithmetic to avoid floating-point precision issues)
-        if report.order_status == "FILLED" {
+        // Remove from active_orders if fully filled (use Binance's typed status
+        // enum instead of f64 arithmetic to avoid floating-point precision issues)
+        if report.order_status == BinanceOrderStatus::Filled {
             self.active_orders.remove(&client_order_id);
             log::debug!(
                 "Order fully filled: client_order_id={client_order_id}, \
@@ -606,12 +597,15 @@ mod tests {
     };
 
     use nautilus_core::{nanos::UnixNanos, time::AtomicTime};
-    use nautilus_model::identifiers::{
-        AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId,
+    use nautilus_model::{
+        enums::OrderSide,
+        identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     };
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::common::enums::{BinanceOrderStatus, BinanceSide, BinanceTimeInForce};
+    use crate::spot::enums::BinanceSpotOrderType;
     use crate::spot::websocket::types_exec::{
         BinanceSpotExecutionReport, BinanceSpotExecutionType,
     };
@@ -661,9 +655,9 @@ mod tests {
             event_time: 1_772_494_860_000,
             symbol: symbol.to_string(),
             client_order_id: client_order_id.to_string(),
-            side: "BUY".to_string(),
-            order_type: "LIMIT".to_string(),
-            time_in_force: "GTC".to_string(),
+            side: BinanceSide::Buy,
+            order_type: BinanceSpotOrderType::Limit,
+            time_in_force: BinanceTimeInForce::Gtc,
             orig_qty: orig_qty.to_string(),
             price: "2045.50".to_string(),
             stop_price: "0.0".to_string(),
@@ -671,8 +665,8 @@ mod tests {
             order_list_id: -1,
             orig_client_order_id: String::new(),
             execution_type: BinanceSpotExecutionType::Trade,
-            order_status: "FILLED".to_string(),
-            reject_reason: "NONE".to_string(),
+            order_status: BinanceOrderStatus::Filled,
+            reject_reason: "NONE".to_string(),  // reject_reason stays String (free-form text)
             order_id: 9_399_999_776,
             last_qty: last_qty.to_string(),
             cumulative_filled_qty: cum_qty.to_string(),
@@ -738,7 +732,7 @@ mod tests {
         // Create a NEW execution report
         let mut report = make_trade_report("TEST-001", -1, "ETHUSDC", "0", "0", "0.01", "0");
         report.execution_type = BinanceSpotExecutionType::New;
-        report.order_status = "NEW".to_string();
+        report.order_status = BinanceOrderStatus::New;
 
         let result = handler.handle_execution_report(&report);
 
@@ -861,7 +855,7 @@ mod tests {
 
         let mut report = make_trade_report("TEST-001", -1, "ETHUSDC", "0", "0", "0.01", "0");
         report.execution_type = BinanceSpotExecutionType::Canceled;
-        report.order_status = "CANCELED".to_string();
+        report.order_status = BinanceOrderStatus::Canceled;
 
         let result = handler.handle_execution_report(&report);
         assert!(result.is_some());
@@ -907,7 +901,7 @@ mod tests {
             "0",
         );
         report.execution_type = BinanceSpotExecutionType::Canceled;
-        report.order_status = "CANCELED".to_string();
+        report.order_status = BinanceOrderStatus::Canceled;
         report.orig_client_order_id = "MY-ORDER-001".to_string(); // "C" — original
 
         let result = handler.handle_execution_report(&report);
@@ -1098,7 +1092,7 @@ mod tests {
             "0.01",
             "0.005",
         );
-        partial_report.order_status = "PARTIALLY_FILLED".to_string();
+        partial_report.order_status = BinanceOrderStatus::PartiallyFilled;
 
         event_tx
             .send(BinanceSpotUserDataEvent::ExecutionReport(Box::new(

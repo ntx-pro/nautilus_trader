@@ -23,6 +23,9 @@
 
 use serde::Deserialize;
 
+use crate::common::enums::{BinanceOrderStatus, BinanceSide, BinanceTimeInForce};
+use crate::spot::enums::BinanceSpotOrderType;
+
 /// Wrapper for all User Data Stream push events from Binance Spot.
 ///
 /// All push events arrive in this envelope format after subscribing via
@@ -58,6 +61,9 @@ pub enum BinanceSpotExecutionType {
     Expired,
     /// Self-trade prevention triggered.
     TradePrevention,
+    /// Unknown or undocumented execution type.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Execution report event from Binance Spot User Data Stream.
@@ -79,15 +85,15 @@ pub struct BinanceSpotExecutionReport {
     /// Client order ID assigned by the submitter.
     #[serde(rename = "c")]
     pub client_order_id: String,
-    /// Side: `"BUY"` or `"SELL"`.
+    /// Order side.
     #[serde(rename = "S")]
-    pub side: String,
-    /// Order type: `"LIMIT"`, `"MARKET"`, etc.
+    pub side: BinanceSide,
+    /// Order type.
     #[serde(rename = "o")]
-    pub order_type: String,
-    /// Time in force: `"GTC"`, `"IOC"`, `"FOK"`.
+    pub order_type: BinanceSpotOrderType,
+    /// Time in force.
     #[serde(rename = "f")]
-    pub time_in_force: String,
+    pub time_in_force: BinanceTimeInForce,
     /// Original order quantity.
     #[serde(rename = "q")]
     pub orig_qty: String,
@@ -111,7 +117,7 @@ pub struct BinanceSpotExecutionReport {
     pub execution_type: BinanceSpotExecutionType,
     /// Current order status.
     #[serde(rename = "X")]
-    pub order_status: String,
+    pub order_status: BinanceOrderStatus,
     /// Order rejection reason (or `"NONE"`).
     #[serde(rename = "r")]
     pub reject_reason: String,
@@ -283,8 +289,8 @@ mod tests {
         assert_eq!(report.symbol, "ETHUSDC");
         assert_eq!(report.client_order_id, "UDS-TEST-1772494856");
         assert_eq!(report.execution_type, BinanceSpotExecutionType::New);
-        assert_eq!(report.side, "BUY");
-        assert_eq!(report.order_type, "LIMIT");
+        assert_eq!(report.side, BinanceSide::Buy);
+        assert_eq!(report.order_type, BinanceSpotOrderType::Limit);
         assert_eq!(report.order_id, 9399999776);
         assert!(report.commission_asset.is_none());
         assert_eq!(report.trade_id, -1);
@@ -297,7 +303,7 @@ mod tests {
         let report: BinanceSpotExecutionReport =
             serde_json::from_str(EXECUTION_REPORT_TRADE).expect("Failed to deserialize TRADE");
         assert_eq!(report.execution_type, BinanceSpotExecutionType::Trade);
-        assert_eq!(report.order_status, "FILLED");
+        assert_eq!(report.order_status, BinanceOrderStatus::Filled);
         assert_eq!(report.last_qty, "0.01000000");
         assert_eq!(report.last_price, "2045.50000000");
         assert_eq!(report.cumulative_filled_qty, "0.01000000");
@@ -313,7 +319,7 @@ mod tests {
         let report: BinanceSpotExecutionReport = serde_json::from_str(EXECUTION_REPORT_CANCELED)
             .expect("Failed to deserialize CANCELED");
         assert_eq!(report.execution_type, BinanceSpotExecutionType::Canceled);
-        assert_eq!(report.order_status, "CANCELED");
+        assert_eq!(report.order_status, BinanceOrderStatus::Canceled);
         assert_eq!(report.orig_client_order_id, "UDS-TEST-1772494856");
         assert_eq!(report.trade_id, -1);
     }
@@ -369,5 +375,22 @@ mod tests {
                 serde_json::from_str(json).unwrap_or_else(|e| panic!("Failed for {json}: {e}"));
             assert_eq!(result, expected, "Mismatch for {json}");
         }
+    }
+
+    #[test]
+    fn deserialize_unknown_execution_type() {
+        let result: BinanceSpotExecutionType =
+            serde_json::from_str(r#""INSURANCE_FUND""#).expect("Should not fail");
+        assert_eq!(result, BinanceSpotExecutionType::Unknown);
+    }
+
+    #[test]
+    fn deserialize_typed_enum_fields_from_json() {
+        let report: BinanceSpotExecutionReport =
+            serde_json::from_str(EXECUTION_REPORT_TRADE).expect("Failed to deserialize");
+        assert_eq!(report.side, BinanceSide::Buy);
+        assert_eq!(report.order_type, BinanceSpotOrderType::Limit);
+        assert_eq!(report.time_in_force, BinanceTimeInForce::Gtc);
+        assert_eq!(report.order_status, BinanceOrderStatus::Filled);
     }
 }

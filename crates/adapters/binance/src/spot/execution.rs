@@ -45,7 +45,7 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::OmsType,
     events::{
-        AccountState, OrderAccepted, OrderCancelRejected, OrderEventAny,
+        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny,
         OrderModifyRejected, OrderRejected, OrderUpdated,
     },
     identifiers::{AccountId, ClientId, Venue, VenueOrderId},
@@ -868,17 +868,34 @@ impl ExecutionClient for BinanceSpotExecutionClient {
     fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
         let http_client = self.http_client.clone();
         let command = cmd.clone();
+        let event_emitter = self.emitter.clone();
+        let trader_id = self.core.trader_id;
+        let account_id = self.core.account_id;
+        let clock = self.clock;
 
         self.spawn_task("cancel_all_orders", async move {
             let canceled_orders = http_client.cancel_all_orders(command.instrument_id).await?;
 
-            // HTTP only logs success. OrderCanceled events come from UDS WebSocket
-            // push events (executionReport with x=CANCELED for each order).
-            log::debug!(
-                "Cancel-all request accepted: instrument={}, count={}",
-                command.instrument_id,
-                canceled_orders.len(),
-            );
+            // Emit OrderCanceled from HTTP response for immediate feedback.
+            // UDS may also deliver CANCELED events — the handler deduplicates
+            // by removing from active_orders on first cancel, mapping any
+            // subsequent cancel to EXTERNAL strategy (benign).
+            for (venue_order_id, client_order_id) in canceled_orders {
+                let canceled_event = OrderCanceled::new(
+                    trader_id,
+                    command.strategy_id,
+                    command.instrument_id,
+                    client_order_id,
+                    UUID4::new(),
+                    command.ts_init,
+                    clock.get_time_ns(),
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                );
+
+                event_emitter.send_order_event(OrderEventAny::Canceled(canceled_event));
+            }
 
             Ok(())
         });
