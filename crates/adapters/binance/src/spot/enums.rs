@@ -64,6 +64,20 @@ pub enum BinanceCancelReplaceMode {
     AllowFailure,
 }
 
+impl From<BinanceSpotOrderType> for OrderType {
+    fn from(value: BinanceSpotOrderType) -> Self {
+        match value {
+            BinanceSpotOrderType::Limit | BinanceSpotOrderType::LimitMaker => Self::Limit,
+            BinanceSpotOrderType::Market => Self::Market,
+            BinanceSpotOrderType::StopLoss | BinanceSpotOrderType::TakeProfit => Self::StopMarket,
+            BinanceSpotOrderType::StopLossLimit | BinanceSpotOrderType::TakeProfitLimit => {
+                Self::StopLimit
+            }
+            BinanceSpotOrderType::Unknown => Self::Market, // Exchange-generated orders
+        }
+    }
+}
+
 /// Converts a Nautilus order type to Binance Spot order type.
 ///
 /// # Errors
