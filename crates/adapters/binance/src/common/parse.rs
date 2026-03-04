@@ -1203,7 +1203,7 @@ mod tests {
             let result = sbe_mantissa_precision(mantissa, exponent);
             assert_eq!(
                 result, expected,
-                "mantissa={mantissa}, exponent={exponent}: expected {expected}, was {result}"
+                "mantissa={mantissa}, exponent={exponent}: expected precision={expected}, was {result}"
             );
         }
 
