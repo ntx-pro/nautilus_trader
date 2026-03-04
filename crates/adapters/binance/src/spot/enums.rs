@@ -96,3 +96,30 @@ pub fn order_type_to_binance_spot(
         _ => anyhow::bail!("Unsupported order type for Binance Spot: {order_type:?}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::enums::OrderType;
+
+    use super::*;
+
+    #[test]
+    fn spot_order_type_unknown_deserializes_from_unknown_string() {
+        let result: BinanceSpotOrderType =
+            serde_json::from_str(r#""CONDITIONAL""#).expect("Should not fail");
+        assert_eq!(result, BinanceSpotOrderType::Unknown);
+    }
+
+    #[test]
+    fn spot_order_type_to_nautilus_all_variants() {
+        assert_eq!(OrderType::from(BinanceSpotOrderType::Limit), OrderType::Limit);
+        assert_eq!(OrderType::from(BinanceSpotOrderType::LimitMaker), OrderType::Limit);
+        assert_eq!(OrderType::from(BinanceSpotOrderType::Market), OrderType::Market);
+        assert_eq!(OrderType::from(BinanceSpotOrderType::StopLoss), OrderType::StopMarket);
+        assert_eq!(OrderType::from(BinanceSpotOrderType::TakeProfit), OrderType::StopMarket);
+        assert_eq!(OrderType::from(BinanceSpotOrderType::StopLossLimit), OrderType::StopLimit);
+        assert_eq!(OrderType::from(BinanceSpotOrderType::TakeProfitLimit), OrderType::StopLimit);
+        // Unknown exchange-generated orders map to Market (consistent with futures adapter)
+        assert_eq!(OrderType::from(BinanceSpotOrderType::Unknown), OrderType::Market);
+    }
+}
