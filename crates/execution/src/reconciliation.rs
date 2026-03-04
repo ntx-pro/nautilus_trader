@@ -1158,6 +1158,16 @@ pub fn create_reconciliation_updated(
     report: &OrderStatusReport,
     ts_now: UnixNanos,
 ) -> OrderEventAny {
+    // Only pass trigger_price for order types that support it.
+    // Limit, Market, and MarketToLimit orders assert trigger_price.is_none()
+    // in their update() methods — passing a spurious trigger_price from the
+    // venue report (e.g. Bybit sends "0.00" for non-conditional orders)
+    // causes a panic.
+    let trigger_price = match order.order_type() {
+        OrderType::Limit | OrderType::Market | OrderType::MarketToLimit => None,
+        _ => report.trigger_price,
+    };
+
     OrderEventAny::Updated(OrderUpdated::new(
         order.trader_id(),
         order.strategy_id(),
@@ -1171,7 +1181,7 @@ pub fn create_reconciliation_updated(
         order.venue_order_id(),
         order.account_id(),
         report.price,
-        report.trigger_price,
+        trigger_price,
         None, // protection_price
     ))
 }
