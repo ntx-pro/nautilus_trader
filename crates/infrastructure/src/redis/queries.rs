@@ -679,6 +679,10 @@ impl DatabaseQueries {
     ///
     /// Reconstructs the full account via [`AccountAny::from_events()`].
     /// Falls back to direct deserialization for backward compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Redis read fails or event deserialization fails.
     pub async fn load_account(
         con: &ConnectionManager,
         trader_key: &str,
