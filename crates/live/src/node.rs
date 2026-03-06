@@ -537,6 +537,72 @@ impl LiveNode {
         Ok(())
     }
 
+    /// Performs a continuous reconciliation cycle against all execution venues.
+    ///
+    /// Uses the same code path as startup reconciliation: queries each execution
+    /// client for mass status (orders, fills, positions), then reconciles any
+    /// discrepancies with cached state.
+    ///
+    /// This method is called periodically from the Running phase `select!` loop
+    /// based on `open_check_interval_secs` and `position_check_interval_secs`.
+    #[allow(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
+    async fn perform_continuous_reconciliation(
+        &mut self,
+        check_name: &str,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<()> {
+        log::debug!("Running {check_name} consistency check");
+
+        let client_ids = self.kernel.exec_engine.borrow().client_ids();
+
+        for client_id in &client_ids {
+            let mass_status_result = self
+                .kernel
+                .exec_engine
+                .borrow_mut()
+                .generate_mass_status(client_id, lookback_mins)
+                .await;
+
+            match mass_status_result {
+                Ok(Some(mass_status)) => {
+                    let exec_engine_rc = self.kernel.exec_engine.clone();
+                    let result = self
+                        .exec_manager
+                        .reconcile_execution_mass_status(mass_status, exec_engine_rc)
+                        .await;
+
+                    if !result.events.is_empty() {
+                        log::info!(
+                            "Continuous {check_name} check for {client_id} reconciled {} events",
+                            result.events.len()
+                        );
+                    }
+
+                    if !result.external_orders.is_empty() {
+                        let exec_engine = self.kernel.exec_engine.borrow();
+                        for external in result.external_orders {
+                            exec_engine.register_external_order(
+                                external.client_order_id,
+                                external.venue_order_id,
+                                external.instrument_id,
+                                external.strategy_id,
+                                external.ts_init,
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    log::debug!("No mass status from {client_id} during {check_name} check");
+                }
+                Err(e) => {
+                    log::error!("Continuous {check_name} check failed for {client_id}: {e}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Run the live node with automatic shutdown handling.
     ///
     /// This method starts the node, runs indefinitely, and handles graceful shutdown
@@ -642,6 +708,93 @@ impl LiveNode {
 
         self.handle.set_state(NodeState::Running);
 
+        // --- Continuous reconciliation interval setup ---
+        let exec_config = &self.config.exec_engine;
+
+        let mut inflight_timer = if exec_config.inflight_check_interval_ms > 0 {
+            let mut interval = tokio::time::interval(
+                Duration::from_millis(u64::from(exec_config.inflight_check_interval_ms)),
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // Consume immediate first tick
+            Some(interval)
+        } else {
+            None
+        };
+
+        let mut open_check_timer = if let Some(secs) = exec_config.open_check_interval_secs {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs_f64(secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            Some(interval)
+        } else {
+            None
+        };
+
+        let mut position_check_timer =
+            if let Some(secs) = exec_config.position_check_interval_secs {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs_f64(secs));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await;
+                Some(interval)
+            } else {
+                None
+            };
+
+        let mut cache_prune_timer = {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            interval
+        };
+
+        let mut purge_orders_timer =
+            if let Some(mins) = exec_config.purge_closed_orders_interval_mins {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(u64::from(mins) * 60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await;
+                Some(interval)
+            } else {
+                None
+            };
+
+        let mut purge_positions_timer =
+            if let Some(mins) = exec_config.purge_closed_positions_interval_mins {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(u64::from(mins) * 60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await;
+                Some(interval)
+            } else {
+                None
+            };
+
+        let mut purge_account_timer =
+            if let Some(mins) = exec_config.purge_account_events_interval_mins {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(u64::from(mins) * 60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await;
+                Some(interval)
+            } else {
+                None
+            };
+
+        if open_check_timer.is_some() || position_check_timer.is_some() {
+            log::info!(
+                "Continuous reconciliation enabled: open_check={}s, position_check={}s",
+                exec_config
+                    .open_check_interval_secs
+                    .map_or("disabled".to_string(), |s| format!("{s}")),
+                exec_config
+                    .position_check_interval_secs
+                    .map_or("disabled".to_string(), |s| format!("{s}")),
+            );
+        }
+
         // Running phase: runs until shutdown deadline expires
         let mut residual_events = 0usize;
 
@@ -686,6 +839,75 @@ impl LiveNode {
                     }
                     AsyncRunner::handle_exec_command(cmd);
                 }
+                // --- Continuous reconciliation branches ---
+                _ = async {
+                    match inflight_timer.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if self.state() == NodeState::Running => {
+                    let events = self.exec_manager.check_inflight_orders();
+                    if !events.is_empty() {
+                        log::info!("Inflight check generated {} reconciliation events", events.len());
+                        for event in events {
+                            self.kernel.exec_engine.borrow_mut().process(event);
+                        }
+                    }
+                }
+                _ = async {
+                    match open_check_timer.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if self.state() == NodeState::Running => {
+                    if let Err(e) = self.perform_continuous_reconciliation(
+                        "open order",
+                        self.config.exec_engine.open_check_lookback_mins.map(u64::from),
+                    ).await {
+                        log::error!("Open order check failed: {e}");
+                    }
+                }
+                _ = async {
+                    match position_check_timer.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if self.state() == NodeState::Running => {
+                    if let Err(e) = self.perform_continuous_reconciliation(
+                        "position",
+                        Some(u64::from(self.config.exec_engine.position_check_lookback_mins)),
+                    ).await {
+                        log::error!("Position check failed: {e}");
+                    }
+                }
+                _ = cache_prune_timer.tick(), if self.state() == NodeState::Running => {
+                    self.exec_manager.prune_recent_fills_cache(60.0);
+                }
+                _ = async {
+                    match purge_orders_timer.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if self.state() == NodeState::Running => {
+                    self.exec_manager.purge_closed_orders();
+                }
+                _ = async {
+                    match purge_positions_timer.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if self.state() == NodeState::Running => {
+                    self.exec_manager.purge_closed_positions();
+                }
+                _ = async {
+                    match purge_account_timer.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if self.state() == NodeState::Running => {
+                    self.exec_manager.purge_account_events();
+                }
+                // --- End continuous reconciliation branches ---
                 result = tokio::signal::ctrl_c(), if self.state() == NodeState::Running => {
                     match result {
                         Ok(()) => log::info!("Received SIGINT, shutting down"),

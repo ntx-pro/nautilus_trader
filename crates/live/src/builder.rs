@@ -27,7 +27,7 @@ use nautilus_system::{
 };
 
 use crate::{
-    config::LiveNodeConfig,
+    config::{LiveExecEngineConfig, LiveNodeConfig},
     manager::{ExecutionManager, ExecutionManagerConfig},
     node::LiveNode,
     runner::AsyncRunner,
@@ -150,6 +150,17 @@ impl LiveNodeBuilder {
     #[must_use]
     pub fn with_reconciliation_lookback_mins(mut self, mins: u32) -> Self {
         self.config.exec_engine.reconciliation_lookback_mins = Some(mins);
+        self
+    }
+
+    /// Set the full execution engine configuration.
+    ///
+    /// This replaces the default [`LiveExecEngineConfig`] with the provided
+    /// configuration, enabling fine-grained control over continuous
+    /// reconciliation intervals, purge schedules, and other engine settings.
+    #[must_use]
+    pub fn with_exec_engine_config(mut self, config: LiveExecEngineConfig) -> Self {
+        self.config.exec_engine = config;
         self
     }
 
