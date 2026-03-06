@@ -32,7 +32,8 @@ use nautilus_common::{
     },
     runner::{
         SyncDataCommandSender, SyncTradingCommandSender, data_cmd_queue_is_empty,
-        drain_data_cmd_queue, drain_trading_cmd_queue, init_data_cmd_sender, init_exec_cmd_sender,
+        drain_data_cmd_queue, drain_order_event_queue, drain_trading_cmd_queue,
+        init_data_cmd_sender, init_exec_cmd_sender, order_event_queue_is_empty,
         trading_cmd_queue_is_empty,
     },
 };
@@ -1020,15 +1021,20 @@ impl BacktestEngine {
     }
 
     fn drain_command_queues(&self) {
-        // Drain trading commands, exec client events, and data commands
-        // in a loop until all queues settle. Handles cascading re-entrancy
-        // (e.g. strategy submits order from on_order_filled).
+        // Drain trading commands, order events, exec client events, and data
+        // commands in a loop until all queues settle. Handles cascading
+        // re-entrancy (e.g. strategy submits order from on_order_filled,
+        // risk engine denies → OrderDenied queued → drained here).
         loop {
             drain_trading_cmd_queue();
+            drain_order_event_queue();
             drain_data_cmd_queue();
             self.drain_exec_client_events();
 
-            if trading_cmd_queue_is_empty() && data_cmd_queue_is_empty() {
+            if trading_cmd_queue_is_empty()
+                && order_event_queue_is_empty()
+                && data_cmd_queue_is_empty()
+            {
                 break;
             }
         }

@@ -28,7 +28,7 @@ use nautilus_common::{
     messages::execution::{ModifyOrder, SubmitOrder, SubmitOrderList, TradingCommand},
     msgbus,
     msgbus::{MessagingSwitchboard, TypedIntoHandler},
-    runner::try_get_trading_cmd_sender,
+    runner::{queue_order_event, try_get_trading_cmd_sender},
     throttler::Throttler,
 };
 use nautilus_core::{UUID4, WeakCell};
@@ -164,9 +164,7 @@ impl RiskEngine {
                 Self::handle_submit_order_cache(&cache, &submit_order);
 
                 let denied = Self::create_order_denied(&submit_order, reason, &clock);
-
-                let endpoint = MessagingSwitchboard::exec_engine_process();
-                msgbus::send_order_event(endpoint, denied);
+                queue_order_event(denied);
             }) as Box<dyn Fn(SubmitOrder)>
         };
 
@@ -210,9 +208,7 @@ impl RiskEngine {
                 };
 
                 let rejected = Self::create_modify_rejected(&order, reason, &clock);
-
-                let endpoint = MessagingSwitchboard::exec_engine_process();
-                msgbus::send_order_event(endpoint, rejected);
+                queue_order_event(rejected);
             }) as Box<dyn Fn(ModifyOrder)>
         };
 
@@ -1290,8 +1286,13 @@ impl RiskEngine {
             self.clock.borrow().timestamp_ns(),
         ));
 
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, denied);
+        // Queue the denied event for deferred dispatch instead of sending
+        // synchronously. This prevents RefCell re-entrancy panics when
+        // deny_order is called during a chain that originates from an event
+        // handler (e.g., strategy submits hedge order from on_order_filled,
+        // risk engine denies, OrderDenied dispatches back into strategy
+        // while original borrow is still active).
+        queue_order_event(denied);
     }
 
     fn deny_order_list(&self, orders: &[OrderAny], reason: &str) {
@@ -1318,8 +1319,7 @@ impl RiskEngine {
             order.account_id(),
         ));
 
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, denied);
+        queue_order_event(denied);
     }
 
     fn execution_gateway(&mut self, instrument: InstrumentAny, command: TradingCommand) {

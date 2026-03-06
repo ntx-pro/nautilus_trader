@@ -25,6 +25,8 @@ use std::{
     sync::Arc,
 };
 
+use nautilus_model::events::OrderEventAny;
+
 use crate::{
     messages::{data::DataCommand, execution::TradingCommand},
     msgbus::{self, MessagingSwitchboard},
@@ -238,10 +240,37 @@ pub fn init_exec_cmd_sender(sender: Arc<dyn TradingCommandSender>) {
     });
 }
 
+/// Queues an order event for deferred dispatch to the execution engine.
+///
+/// This prevents `RefCell` re-entrancy when the risk engine denies an order
+/// during a call chain that originates from an event handler (e.g., a strategy
+/// submitting a hedge from `on_order_filled`). The event is dispatched on the
+/// next `drain_order_event_queue()` call, after all borrows are released.
+pub fn queue_order_event(event: OrderEventAny) {
+    ORDER_EVENT_QUEUE.with(|q| q.borrow_mut().push(event));
+}
+
+/// Drain all buffered order events, dispatching each to the execution engine.
+pub fn drain_order_event_queue() {
+    ORDER_EVENT_QUEUE.with(|q| {
+        let events: Vec<OrderEventAny> = q.borrow_mut().drain(..).collect();
+        let endpoint = MessagingSwitchboard::exec_engine_process();
+        for event in events {
+            msgbus::send_order_event(endpoint, event);
+        }
+    });
+}
+
+/// Returns `true` if the order event queue is empty.
+pub fn order_event_queue_is_empty() -> bool {
+    ORDER_EVENT_QUEUE.with(|q| q.borrow().is_empty())
+}
+
 thread_local! {
     static TIME_EVENT_SENDER: OnceCell<Arc<dyn TimeEventSender>> = const { OnceCell::new() };
     static DATA_CMD_SENDER: OnceCell<Arc<dyn DataCommandSender>> = const { OnceCell::new() };
     static EXEC_CMD_SENDER: OnceCell<Arc<dyn TradingCommandSender>> = const { OnceCell::new() };
     static DATA_CMD_QUEUE: RefCell<Vec<DataCommand>> = const { RefCell::new(Vec::new()) };
     static TRADING_CMD_QUEUE: RefCell<Vec<TradingCommand>> = const { RefCell::new(Vec::new()) };
+    static ORDER_EVENT_QUEUE: RefCell<Vec<OrderEventAny>> = const { RefCell::new(Vec::new()) };
 }

@@ -22,8 +22,8 @@ use nautilus_common::{
     },
     msgbus::{self, MessagingSwitchboard},
     runner::{
-        DataCommandSender, TimeEventSender, TradingCommandSender, set_data_cmd_sender,
-        set_exec_cmd_sender, set_time_event_sender,
+        DataCommandSender, TimeEventSender, TradingCommandSender, drain_order_event_queue,
+        set_data_cmd_sender, set_exec_cmd_sender, set_time_event_sender,
     },
     timer::TimeEventHandler,
 };
@@ -252,6 +252,10 @@ impl AsyncRunner {
                     return;
                 }
             };
+
+            // Drain any order events queued during handler execution
+            // (e.g., OrderDenied from RiskEngine during command processing).
+            drain_order_event_queue();
         }
     }
 

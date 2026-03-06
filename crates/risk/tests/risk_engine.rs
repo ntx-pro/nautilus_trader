@@ -26,6 +26,7 @@ use nautilus_common::{
         self, MessagingSwitchboard,
         stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
     },
+    runner::drain_order_event_queue,
     throttler::RateLimit,
 };
 use nautilus_core::{UUID4, UnixNanos};
@@ -134,6 +135,7 @@ fn test_deny_order_on_price_precision_exceeded(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
 
     // Expect an OrderDenied to be emitted
     let saved_events = get_process_order_event_handler_messages(&process_handler);
@@ -211,6 +213,7 @@ fn test_deny_order_exceeding_max_notional(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
 
     let saved_events = get_process_order_event_handler_messages(&process_handler);
     assert_eq!(saved_events.len(), 1);
@@ -1100,6 +1103,7 @@ fn test_submit_order_reduce_only_order_with_custom_position_id_not_open_then_den
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1165,6 +1169,7 @@ fn test_submit_order_when_instrument_not_in_cache_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1234,6 +1239,7 @@ fn test_submit_order_when_invalid_price_precision_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1307,6 +1313,7 @@ fn test_submit_order_when_invalid_negative_price_and_not_option_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1499,6 +1506,7 @@ fn test_submit_order_when_invalid_trigger_price_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1569,6 +1577,7 @@ fn test_submit_order_when_invalid_quantity_precision_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1637,6 +1646,7 @@ fn test_submit_order_when_invalid_quantity_exceeds_maximum_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1705,6 +1715,7 @@ fn test_submit_order_when_invalid_quantity_less_than_minimum_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -1851,6 +1862,7 @@ fn test_submit_order_when_less_than_min_notional_for_instrument_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
 
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
@@ -1936,6 +1948,7 @@ fn test_submit_order_when_greater_than_max_notional_for_instrument_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -2018,6 +2031,7 @@ fn test_submit_order_when_buy_market_order_and_over_max_notional_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -2100,6 +2114,7 @@ fn test_submit_order_when_sell_market_order_and_over_max_notional_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -2170,6 +2185,7 @@ fn test_submit_order_when_market_order_and_over_free_balance_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 1);
@@ -2326,6 +2342,7 @@ fn test_submit_order_list_buys_when_over_free_balance_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrderList(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
 
@@ -2417,6 +2434,7 @@ fn test_submit_order_list_sells_when_over_free_balance_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrderList(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
 
@@ -2481,6 +2499,7 @@ fn test_submit_order_when_trading_halted_then_denies_order(
     risk_engine.set_trading_state(TradingState::Halted);
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
 
     // Get messages and test
     let saved_messages = get_process_order_event_handler_messages(&process_order_event_handler);
@@ -2547,6 +2566,7 @@ fn test_submit_order_beyond_rate_limit_then_denies_order(
 
         risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
     }
+    drain_order_event_queue();
 
     assert_eq!(risk_engine.throttled_submit_order.used(), 1.0);
 
@@ -2649,6 +2669,7 @@ fn test_submit_order_list_when_trading_halted_then_denies_orders(
 
     risk_engine.set_trading_state(TradingState::Halted);
     risk_engine.execute(TradingCommand::SubmitOrderList(submit_bracket));
+    drain_order_event_queue();
 
     // Get messages and test
     let saved_process_messages =
@@ -3044,6 +3065,7 @@ fn test_submit_bracket_order_when_instrument_not_in_cache_then_denies(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrderList(submit_bracket));
+    drain_order_event_queue();
 
     // Get messages and test
     let saved_process_messages =
@@ -3169,6 +3191,7 @@ fn test_modify_order_beyond_rate_limit_then_rejects(
         );
 
         risk_engine.execute(TradingCommand::ModifyOrder(modify_order));
+        drain_order_event_queue();
     }
 
     assert_eq!(risk_engine.throttled_modify_order.used(), 1.0);
@@ -3328,6 +3351,7 @@ fn test_submit_order_when_market_order_and_over_free_balance_then_denies_with_be
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 0); // Currently, it executes because check_orders_risk returns true for margin_account
@@ -3397,6 +3421,7 @@ fn test_submit_order_for_less_than_max_cum_transaction_value_adausdt_with_crypto
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 0);
@@ -3729,6 +3754,7 @@ fn test_submit_order_with_quote_quantity_exceeds_max_after_conversion(
     );
 
     risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    drain_order_event_queue();
 
     // The order should be denied because effective_quantity (1 BTC) > max_quantity (0.5 BTC)
     let saved_process_messages =

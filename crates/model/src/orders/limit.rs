@@ -457,11 +457,9 @@ impl Order for LimitOrder {
     }
 
     fn update(&mut self, event: &OrderUpdated) {
-        assert!(
-            event.trigger_price.is_none(),
-            "{}",
-            OrderError::InvalidOrderEvent
-        );
+        // LimitOrder has no trigger_price — safely ignore if present in the event.
+        // Venues like Bybit may populate trigger_price in OrderUpdated even for
+        // plain limit orders (the field is shared across all order types).
 
         if let Some(price) = event.price {
             self.price = price;
@@ -749,6 +747,63 @@ mod tests {
 
         assert_eq!(accepted_order.quantity(), updated_quantity);
         assert_eq!(accepted_order.price(), Some(updated_price));
+    }
+
+    #[rstest]
+    fn test_limit_order_update_with_trigger_price_ignores_it() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC-USDT.BINANCE"))
+            .quantity(Quantity::from(10))
+            .price(Price::new(100.0, 2))
+            .build();
+
+        let mut accepted_order = TestOrderStubs::make_accepted_order(&order);
+
+        let updated_price = Price::new(110.0, 2);
+        let updated_quantity = Quantity::from(8);
+
+        let event = OrderUpdated {
+            client_order_id: accepted_order.client_order_id(),
+            strategy_id: accepted_order.strategy_id(),
+            price: Some(updated_price),
+            quantity: updated_quantity,
+            trigger_price: Some(Price::new(95.0, 2)),
+            ..Default::default()
+        };
+
+        // Must not panic — trigger_price is irrelevant for LimitOrder
+        accepted_order.apply(OrderEventAny::Updated(event)).unwrap();
+
+        assert_eq!(accepted_order.quantity(), updated_quantity);
+        assert_eq!(accepted_order.price(), Some(updated_price));
+    }
+
+    #[rstest]
+    fn test_limit_order_update_quantity_only() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC-USDT.BINANCE"))
+            .quantity(Quantity::from(10))
+            .price(Price::new(100.0, 2))
+            .build();
+
+        let mut accepted_order = TestOrderStubs::make_accepted_order(&order);
+        let original_price = accepted_order.price().unwrap();
+
+        let updated_quantity = Quantity::from(3);
+
+        let event = OrderUpdated {
+            client_order_id: accepted_order.client_order_id(),
+            strategy_id: accepted_order.strategy_id(),
+            price: None,
+            quantity: updated_quantity,
+            ..Default::default()
+        };
+
+        accepted_order.apply(OrderEventAny::Updated(event)).unwrap();
+
+        assert_eq!(accepted_order.quantity(), updated_quantity);
+        assert_eq!(accepted_order.price(), Some(original_price));
+        assert_eq!(accepted_order.leaves_qty(), updated_quantity);
     }
 
     #[rstest]
