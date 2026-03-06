@@ -579,7 +579,7 @@ fn create_s3_store(
     let (url, path) = parse_url_and_path(uri)?;
     let bucket = extract_host(&url, "Invalid S3 URI: missing bucket")?;
 
-    let mut builder = object_store::aws::AmazonS3Builder::new().with_bucket_name(&bucket);
+    let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(&bucket);
 
     // Apply storage options if provided
     if let Some(options) = storage_options {
