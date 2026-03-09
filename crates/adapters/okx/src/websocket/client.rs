@@ -446,7 +446,7 @@ impl OKXWebSocketClient {
             reconnect_backoff_factor: None,   // Use default
             reconnect_jitter_ms: None,        // Use default
             reconnect_max_attempts: None,
-            idle_timeout_ms: None,
+            idle_timeout_ms: Some(45_000),
         };
 
         // Configure rate limits for different operation types

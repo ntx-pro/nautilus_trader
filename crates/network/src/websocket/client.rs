@@ -592,7 +592,6 @@ impl WebSocketClientInner {
                     }
                     Ok(Some(Ok(Message::Ping(ping_data)))) => {
                         log::trace!("Received ping: {ping_data:?}");
-                        last_data_time = tokio::time::Instant::now();
 
                         if let Some(ref handler) = ping_handler {
                             handler(ping_data.to_vec());
@@ -600,7 +599,6 @@ impl WebSocketClientInner {
                     }
                     Ok(Some(Ok(Message::Pong(_)))) => {
                         log::trace!("Received pong");
-                        last_data_time = tokio::time::Instant::now();
                     }
                     Ok(Some(Ok(Message::Close(_)))) => {
                         log::debug!("Received close message - terminating");
