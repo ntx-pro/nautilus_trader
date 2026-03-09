@@ -96,6 +96,7 @@ pub struct BinanceSpotExecutionClient {
     uds_client: Option<BinanceSpotUserDataStream>,
     exec_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<SpotExecHandlerCommand>>,
     handler_signal: Arc<AtomicBool>,
+    first_reconciliation: AtomicBool,
     uds_task: Mutex<Option<JoinHandle<()>>>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -152,6 +153,7 @@ impl BinanceSpotExecutionClient {
             uds_client: None,
             exec_cmd_tx: None,
             handler_signal: Arc::new(AtomicBool::new(false)),
+            first_reconciliation: AtomicBool::new(true),
             uds_task: Mutex::new(None),
             pending_tasks: Mutex::new(Vec::new()),
         })
@@ -1119,14 +1121,48 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
         });
 
-        // Binance requires instrument_id for historical orders (open_only=false).
-        // Use open_only=true for mass status to get all open orders across instruments.
-        let order_cmd = GenerateOrderStatusReportsBuilder::default()
-            .ts_init(ts_now)
-            .open_only(true)
-            .start(start)
-            .build()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let is_first = self.first_reconciliation.swap(false, Ordering::AcqRel);
+
+        // Collect order status reports.
+        // First reconciliation: use global openOrders query (safety, catches all).
+        // Subsequent: per-symbol queries to avoid 80-weight global endpoint (Q-025).
+        let order_reports = if is_first {
+            log::info!("First reconciliation: using global openOrders query");
+            let order_cmd = GenerateOrderStatusReportsBuilder::default()
+                .ts_init(ts_now)
+                .open_only(true)
+                .start(start)
+                .build()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.generate_order_status_reports(&order_cmd).await?
+        } else {
+            // Collect instrument IDs before any await (cache Ref is not Send)
+            let instrument_ids: Vec<_> = {
+                let cache = self.core.cache();
+                cache
+                    .instrument_ids(Some(&*BINANCE_VENUE))
+                    .into_iter()
+                    .copied()
+                    .collect()
+            };
+            log::info!(
+                "Subsequent reconciliation: per-symbol queries for {} instruments",
+                instrument_ids.len(),
+            );
+            let mut all_reports = Vec::new();
+            for instrument_id in &instrument_ids {
+                let order_cmd = GenerateOrderStatusReportsBuilder::default()
+                    .ts_init(ts_now)
+                    .open_only(true)
+                    .instrument_id(Some(*instrument_id))
+                    .start(start)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let reports = self.generate_order_status_reports(&order_cmd).await?;
+                all_reports.extend(reports);
+            }
+            all_reports
+        };
 
         let position_cmd = GeneratePositionStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -1134,10 +1170,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let (order_reports, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
-            self.generate_position_status_reports(&position_cmd),
-        )?;
+        let position_reports = self.generate_position_status_reports(&position_cmd).await?;
 
         // Note: Fill reports require instrument_id for Binance, so we skip them in mass status
         // They would need to be fetched per-instrument if needed
