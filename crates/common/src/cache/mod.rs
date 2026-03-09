@@ -1449,6 +1449,9 @@ impl Cache {
             .entry(quote.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         quotes_deque.push_front(quote);
+        if quotes_deque.len() > self.config.tick_capacity {
+            quotes_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1479,6 +1482,9 @@ impl Cache {
         for quote in quotes {
             quotes_deque.push_front(*quote);
         }
+        while quotes_deque.len() > self.config.tick_capacity {
+            quotes_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1501,6 +1507,9 @@ impl Cache {
             .entry(trade.instrument_id)
             .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
         trades_deque.push_front(trade);
+        if trades_deque.len() > self.config.tick_capacity {
+            trades_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1531,6 +1540,9 @@ impl Cache {
         for trade in trades {
             trades_deque.push_front(*trade);
         }
+        while trades_deque.len() > self.config.tick_capacity {
+            trades_deque.pop_back();
+        }
         Ok(())
     }
 
@@ -1553,6 +1565,9 @@ impl Cache {
             .entry(bar.bar_type)
             .or_insert_with(|| VecDeque::with_capacity(self.config.bar_capacity));
         bars.push_front(bar);
+        if bars.len() > self.config.bar_capacity {
+            bars.pop_back();
+        }
         Ok(())
     }
 
@@ -1578,10 +1593,13 @@ impl Cache {
         let bars_deque = self
             .bars
             .entry(bar_type)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(self.config.bar_capacity));
 
         for bar in bars {
             bars_deque.push_front(*bar);
+        }
+        while bars_deque.len() > self.config.bar_capacity {
+            bars_deque.pop_back();
         }
         Ok(())
     }
